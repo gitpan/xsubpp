@@ -1,0 +1,47 @@
+int			T_IV		$
+unsigned		T_IV		$
+unsigned int		T_IV		$
+long			T_IV		$
+unsigned long		T_IV		$
+short			T_IV		$
+unsigned short		T_IV
+char			T_CHAR
+unsigned char		T_U_CHAR
+char *			T_PV
+unsigned char *		T_PV
+caddr_t			T_PV
+wchar_t *		T_PV
+wchar_t			T_IV
+bool_t			T_IV
+size_t			T_IV
+ssize_t			T_IV
+time_t			T_NV
+unsigned long *		T_OPAQUEPTR
+char **			T_PACKED
+void *			T_PTR
+Time_t *		T_PV
+SV *			T_SV
+SVREF			T_SVREF
+AV *			T_AVREF
+HV *			T_HVREF
+CV *			T_CVREF
+
+IV			T_IV
+I32			T_IV
+I16			T_IV
+I8			T_IV
+U32			T_U_LONG
+U16			T_U_SHORT
+U8			T_IV
+Result			T_U_CHAR
+Boolean			T_IV
+double			T_DOUBLE
+SysRet			T_SYSRET
+SysRetLong		T_SYSRET
+FILE *			T_IN
+FileHandle		T_PTROBJ
+Object *		T_PTROBJ
+InputStream		T_IN
+InOutStream		T_INOUT
+OutputStream		T_OUT
+

@@ -1,95 +1,69 @@
-#!./miniperl
+#!./miniperl 
 
-=head1 NAME
+# Filename:     %M%
+# SCCS Info :	%I%, %G%
 
-xsubpp - compiler to convert Perl XS code into C code
+require 5.002;
+use vars '$cplusplus';
 
-=head1 SYNOPSIS
-
-B<xsubpp> [B<-v>] [B<-C++>] [B<-except>] [B<-s pattern>] [B<-typemap typemap>]... file.xs
-
-=head1 DESCRIPTION
-
-I<xsubpp> will compile XS code into C code by embedding the constructs
-necessary to let C functions manipulate Perl values and creates the glue
-necessary to let Perl access those functions.  The compiler uses typemaps to
-determine how to map C function parameters and variables to Perl values.
-
-The compiler will search for typemap files called I<typemap>.  It will use
-the following search path to find default typemaps, with the rightmost
-typemap taking precedence.
-
-	../../../typemap:../../typemap:../typemap:typemap
-
-=head1 OPTIONS
-
-=over 5
-
-=item B<-C++>
-
-Adds ``extern "C"'' to the C code.
-
-
-=item B<-except>
-
-Adds exception handling stubs to the C code.
-
-=item B<-typemap typemap>
-
-Indicates that a user-supplied typemap should take precedence over the
-default typemaps.  This option may be used multiple times, with the last
-typemap having the highest precedence.
-
-=item B<-v>
-
-Prints the I<xsubpp> version number to standard output, then exits.
-
-=back
-
-=head1 ENVIRONMENT
-
-No environment variables are used.
-
-=head1 AUTHOR
-
-Larry Wall
-
-=head1 MODIFICATION HISTORY
-
-See the file F<changes.pod>.
-
-=head1 SEE ALSO
-
-perl(1), perlapi(1)
-
-=cut
+sub Q ;
 
 # Global Constants
-$XSUBPP_version = "1.922";
-require 5.001;
+$VERSION = "2.002" ;
 
-$usage = "Usage: xsubpp [-v] [-C++] [-except] [-s pattern] [-typemap typemap]... file.xs\n";
+$Cdata_C    = "Cdata" ;
+$Cdata_perl = "Cdata" ;
 
+$t_ARRAY  = 0 ;
+$t_HASH   = 1 ;
+$t_SCALAR = 2 ;
+
+$FH = 'File0000' ;
+
+$usage = "Usage: xsubpp [-v] [-C++] [-except] [-prototypes] [-noversioncheck] [-s pattern] [-typemap typemap]... file.xs\n";
+
+$proto_re = "[" . quotemeta('\$%&*@;') . "]" ;
+  
 $except = "";
+$WantPrototypes = -1 ;
+$WantVersionChk = 1 ;
+$ProtoUsed = 0 ;
+
+# Parse the Command Line
 SWITCH: while (@ARGV and $ARGV[0] =~ /^-./) {
     $flag = shift @ARGV;
     $flag =~ s/^-// ;
     $spat = shift,	next SWITCH	if $flag eq 's';
     $cplusplus = 1,	next SWITCH	if $flag eq 'C++';
+    $WantPrototypes = 0, next SWITCH  	if $flag eq 'noprototypes';
+    $WantPrototypes = 1, next SWITCH  	if $flag eq 'prototypes';
+    $WantVersionChk = 0, next SWITCH	if $flag eq 'noversioncheck';
+    $WantVersionChk = 1, next SWITCH	if $flag eq 'versioncheck';
     $except = " TRY",	next SWITCH	if $flag eq 'except';
     push(@tm,shift),	next SWITCH	if $flag eq 'typemap';
-    (print "xsubpp version $XSUBPP_version\n"), exit  	
+    (print "xsubpp version $VERSION\n"), exit
 	if $flag eq 'v';
     die $usage;
 }
+if ($WantPrototypes == -1)
+  { $WantPrototypes = 0}
+else
+  { $ProtoUsed = 1 }
+
 @ARGV == 1 or die $usage;
-chomp($pwd = `pwd`);
-# Check for error message from VMS
-if ($pwd =~ /unrecognized command verb/) { $Is_VMS = 1; $pwd = $ENV{DEFAULT} }
 ($dir, $filename) = $ARGV[0] =~ m#(.*)/(.*)#
 	or ($dir, $filename) = $ARGV[0] =~ m#(.*[>\]])(.*)#
 	or ($dir, $filename) = ('.', $ARGV[0]);
 chdir($dir);
+# Check for VMS; Config.pm may not be installed yet, but this routine
+# is built into VMS perl
+if (defined(&VMS::Filespec::vmsify)) { $Is_VMS = 1; $pwd = $ENV{DEFAULT}; }
+else                                 { $Is_VMS = 0; chomp($pwd = `pwd`);   }
+
+++ $IncludedFiles{$ARGV[0]} ;
+
+my(@XSStack) = ({type => 'none'});    # Stack of conditionals and INCLUDEs
+my($XSS_work_idx, $cpp_next_tmp) = (0, "XSubPPtmpAAAA");
 
 sub TrimWhitespace
 {
@@ -104,6 +78,9 @@ sub TidyType
     s#\s*(\*+)\s*#$1#g;
     s#(\*+)# $1 #g ;
 
+    # sort out any []
+    s/\[\s*([^\]]*)\s*\]/[$1]/ ;
+
     # change multiple whitespace into a single space
     s/\s+/ /g ;
     
@@ -111,6 +88,12 @@ sub TidyType
     TrimWhitespace($_) ;
 
     $_ ;
+}
+
+sub checkEval
+{
+    die "eval failed: $@\n"
+	if $@ ;
 }
 
 $typemap = shift @ARGV;
@@ -128,22 +111,46 @@ foreach $typemap (@tm) {
     open(TYPEMAP, $typemap) 
 	or warn ("Warning: could not open typemap file '$typemap': $!\n"), next;
     $mode = 'Typemap';
+    $Kind = \%xsub_type_kind ;
     $junk = "" ;
     $current = \$junk;
     while (<TYPEMAP>) {
-	next if /^\s*#/;
-	if (/^INPUT\s*$/)   { $mode = 'Input';   $current = \$junk;  next; }
-	if (/^OUTPUT\s*$/)  { $mode = 'Output';  $current = \$junk;  next; }
-	if (/^TYPEMAP\s*$/) { $mode = 'Typemap'; $current = \$junk;  next; }
+	next if /^#/;
+	my $line = $_ ;
+	chomp($line) ;
+	if (/^INPUT\s*$/)  { $mode = 'Input';  $current = \$junk;  next }
+	if (/^OUTPUT\s*$/) { $mode = 'Output'; $current = \$junk;  next }
+	if (s/^TYPEMAP\s*//) { 
+	    $mode = 'Typemap' ;
+	    if (/^(XSUB)?\s*$/)
+	      { $Kind = \%xsub_type_kind }
+	    elsif (/^HASH\s*$/)
+	      { $Kind = \%hash_type_kind }
+	    elsif (/^ARRAY\s*$/)
+	      { $Kind = \%array_type_kind }
+	    elsif (/^SCALAR\s*$/)
+	      { $Kind = \%scalar_type_kind }
+	    else
+	      { die "Error: File '$typemap' Line $. '$line' illegal TYPEMAP" }
+	    $current = \$junk; 
+	    next 
+	}
+
 	if ($mode eq 'Typemap') {
 	    chomp;
 	    my $line = $_ ;
             TrimWhitespace($_) ;
 	    # skip blank lines and comment lines
 	    next if /^$/ or /^#/ ;
-	    my($type,$kind) = /^\s*(.*?\S)\s+(\S+)\s*$/ or
-		warn("Warning: File '$typemap' Line $. '$line' TYPEMAP entry needs 2 columns\n"), next;
-	    $type_kind{TidyType($type)} = $kind ;
+	    my($type,$kind, $proto) = /^\s*(.*?\S)\s+(\S+)\s*($proto_re*)\s*$/ or
+	        warn("Warning: File '$typemap' Line $. '$line' TYPEMAP entry needs 2 or 3 columns\n"), next ;
+            $type = TidyType($type) ;
+	    $Kind->{$type} = $kind ;
+            # prototype defaults to '$'
+	    $proto = "\$" unless $proto ;
+	    warn("Warning: File '$typemap' Line $. '$line' Invalid prototype '$proto'\n")
+		unless ValidProtoString($proto) ;
+            $proto_letter{$type} = C_string($proto) ;
 	}
 	elsif (/^\s/) {
 	    $$current .= $_;
@@ -169,7 +176,11 @@ foreach $key (keys %input_expr) {
 $END = "!End!\n\n";		# "impossible" keyword (multiple newline)
 
 # Match an XS keyword
-$BLOCK_re= "\\s*(REQUIRE|BOOT|CASE|PREINIT|INPUT|INIT|CODE|PPCODE|OUTPUT|CLEANUP|ALIAS|$END)\\s*:";
+$BLOCK_re= '\s*(' . join('|', qw(
+	REQUIRE BOOT CASE PREINIT INPUT INIT CODE PPCODE OUTPUT 
+	CLEANUP ALIAS PROTOTYPES PROTOTYPE VERSIONCHECK INCLUDE
+	SCOPE
+	)) . "|$END)\\s*:";
 
 # Input:  ($_, @line) == unparsed input.
 # Output: ($_, @line) == (rest of line, following lines).
@@ -185,6 +196,15 @@ sub print_section {
     for (;  defined($_) && !/^$BLOCK_re/o;  $_ = shift(@line)) {
 	print "$_\n";
     }
+}
+
+sub process_keyword($)
+{
+    my($pattern) = @_ ;
+    my $kwd ;
+
+    &{"${kwd}_handler"}() 
+        while $kwd = check_keyword($pattern) ;
 }
 
 sub CASE_handler {
@@ -225,6 +245,9 @@ sub INPUT_handler {
 	$var_types{$var_name} = $var_type;
 	print "\t" . &map_type($var_type);
 	$var_num = $args_match{$var_name};
+
+	$proto_arg[$var_num] = ProtoString($var_type) 
+	    if $var_num ;
 	if ($var_addr) {
 	    $var_addr{$var_name} = 1;
 	    $func_args =~ s/\b($var_name)\b/&$1/;
@@ -267,6 +290,10 @@ sub OUTPUT_handler {
     }
 }
 
+sub CLEANUP_handler() { print_section() } 
+sub PREINIT_handler() { print_section() } 
+sub INIT_handler()    { print_section() } 
+
 sub GetAliases
 {
     my ($line) = @_ ;
@@ -284,49 +311,247 @@ sub GetAliases
         $value = $2 ;
 
         # check for optional package definition in the alias
-	$alias = $Packprefix . $alias if $alias !~ /::/ ;
-        
+        $alias = $Packprefix . $alias if $alias !~ /::/ ;
+
         # check for duplicate alias name & duplicate value
-	Warn("Warning: Ignoring duplicate alias '$orig_alias'")
-	    if defined $XsubAliases{$pname}{$alias} ;
+        Warn("Warning: Ignoring duplicate alias '$orig_alias'")
+          if defined $XsubAliases{$alias} ;
 
-        Warn("Warning: Aliases '$orig_alias' and '$XsubAliasValues{$pname}{$value}' have identical values")
-	    if $XsubAliasValues{$pname}{$value} ;
+        Warn("Warning: Aliases '$orig_alias' and '$XsubAliasValues{$value}' have identical values")
+          if $XsubAliasValues{$value} ;
 
-        $XsubAliases{$pname}{$alias} = $value ;
-        $XsubAliasValues{$pname}{$value} = $orig_alias ;
+        $XsubAliases = 1;
+        $XsubAliases{$alias} = $value ;
+        $XsubAliasValues{$value} = $orig_alias ;
     }
 
     blurt("Error: Cannot parse ALIAS definitions from '$orig'")
         if $line ;
 }
 
-sub ALIAS_handler
+sub ALIAS_handler()
 {
     for (;  !/^$BLOCK_re/o;  $_ = shift(@line)) {
-	next unless /\S/;
-	TrimWhitespace($_) ;
-        GetAliases($_) if $_ ;
+      next unless /\S/;
+      TrimWhitespace($_) ;
+      GetAliases($_) if $_ ;
     }
 }
 
-sub REQUIRE_handler
+sub REQUIRE_handler()
 {
     # the rest of the current line should contain a version number
     my ($Ver) = $_ ;
-
+ 
     TrimWhitespace($Ver) ;
-
+ 
     death ("Error: REQUIRE expects a version number")
-	unless $Ver ;
-
+        unless $Ver ;
+ 
     # check that the version number is of the form n.n
-    death ("Error: REQUIRE: expected a number, got '$Ver'")
-	unless $Ver =~ /^\d+(\.\d*)?/ ;
-
-    death ("Error: xsubpp $Ver (or better) required--this is only $XSUBPP_version.")
-        unless $XSUBPP_version >= $Ver ; 
+    death ("Error: REQUIRE expected a number, got '$Ver'")
+        unless $Ver =~ /^\d+(\.\d*)?/ ;
+ 
+    death ("Error: xsubpp $Ver (or better) required--this is only $VERSION")
+        unless $VERSION >= $Ver ;
 }
+
+sub VERSIONCHECK_handler ()
+{
+    # the rest of the current line should contain either ENABLE or
+    # DISABLE
+ 
+    TrimWhitespace($_) ;
+ 
+    # check for ENABLE/DISABLE
+    death ("Error: VERSIONCHECK: ENABLE/DISABLE")
+        unless /^(ENABLE|DISABLE)/i ;
+ 
+    $WantVersionChk = 1 if $1 eq 'ENABLE' ;
+    $WantVersionChk = 0 if $1 eq 'DISABLE' ;
+ 
+}
+
+sub PROTOTYPE_handler ()
+{
+    my $specified ;
+    death("Error: Only 1 PROTOTYPE definition allowed per xsub")
+        if $proto_in_this_xsub ++ ;
+
+    for (;  !/^$BLOCK_re/o;  $_ = shift(@line)) {
+        next unless /\S/;
+	$specified = 1;
+        TrimWhitespace($_) ;
+        if ($_ eq 'DISABLE') {
+            $ProtoThisXSUB = 0 
+        }
+        elsif ($_ eq 'ENABLE') {
+            $ProtoThisXSUB = 1 
+        }
+        else {
+            # remove any whitespace
+            s/\s+//g ;
+            death("Error: Invalid prototype '$_'")
+                unless ValidProtoString($_) ;
+            $ProtoThisXSUB = C_string($_) ;
+        }
+    }
+    # If no prototype specified, then assume empty prototype ""
+    $ProtoThisXSUB = 2 unless $specified ;
+
+    $ProtoUsed = 1 ;
+}
+
+sub SCOPE_handler ()
+{
+    death("Error: Only 1 SCOPE declaration allowed per xsub") 
+        if $scope_in_this_xsub ++ ;
+
+    for (;  !/^$BLOCK_re/o;  $_ = shift(@line)) {
+              next unless /\S/;
+              TrimWhitespace($_) ;
+        if ($_ =~ /^DISABLE/i) {
+                 $ScopeThisXSUB = 0 
+        }
+        elsif ($_ =~ /^ENABLE/i) {
+                 $ScopeThisXSUB = 1 
+        }
+    }
+
+}
+
+sub PROTOTYPES_handler ()
+{
+    # the rest of the current line should contain either ENABLE or
+    # DISABLE 
+
+    TrimWhitespace($_) ;
+
+    # check for ENABLE/DISABLE
+    death ("Error: PROTOTYPES: ENABLE/DISABLE")
+        unless /^(ENABLE|DISABLE)/i ;
+
+    $WantPrototypes = 1 if $1 eq 'ENABLE' ;
+    $WantPrototypes = 0 if $1 eq 'DISABLE' ;
+    $ProtoUsed = 1 ;
+
+}
+
+sub INCLUDE_handler ()
+{
+    # the rest of the current line should contain a valid filename
+ 
+    TrimWhitespace($_) ;
+ 
+    death("INCLUDE: filename missing")
+        unless $_ ;
+
+    death("INCLUDE: output pipe is illegal")
+        if /^\s*\|/ ;
+
+    # simple minded recursion detector
+    death("INCLUDE loop detected")
+        if $IncludedFiles{$_} ;
+
+    ++ $IncludedFiles{$_} unless /\|\s*$/ ;
+
+    # Save the current file context.
+    push(@XSStack, {
+	type		=> 'file',
+        LastLine        => $lastline,
+        LastLineNo      => $lastline_no,
+        Line            => \@line,
+        LineNo          => \@line_no,
+        Filename        => $filename,
+        Handle          => $FH,
+        }) ;
+ 
+    ++ $FH ;
+
+    # open the new file
+    open ($FH, "$_") or death("Cannot open '$_': $!") ;
+ 
+    print Q<<"EOF" ;
+#
+#/* INCLUDE:  Including '$_' from '$filename' */
+#
+EOF
+
+    $filename = $_ ;
+
+    # Prime the pump by reading the first 
+    # non-blank line
+
+    # skip leading blank lines
+    while (<$FH>) {
+        last unless /^\s*$/ ;
+    }
+
+    $lastline = $_ ;
+    $lastline_no = $. ;
+ 
+}
+ 
+sub PopFile()
+{
+    return 0 unless $XSStack[-1]{type} eq 'file' ;
+ 
+    my $data     = pop @XSStack ;
+    my $ThisFile = $filename ;
+    my $isPipe   = ($filename =~ /\|\s*$/) ;
+ 
+    -- $IncludedFiles{$filename} unless $isPipe ;
+
+    close $FH ;
+
+    $FH         = $data->{Handle} ;
+    $filename   = $data->{Filename} ;
+    $lastline   = $data->{LastLine} ;
+    $lastline_no = $data->{LastLineNo} ;
+    @line       = @{ $data->{Line} } ;
+    @line_no    = @{ $data->{LineNo} } ;
+ 
+    if ($isPipe and $? ) {
+        -- $lastline_no ;
+        print STDERR "Error reading from pipe '$ThisFile': $! in $filename, line $lastline_no\n"  ;
+        exit 1 ;
+    }
+
+    print Q<<"EOF" ;
+#
+#/* INCLUDE: Returning to '$filename' from '$ThisFile' */
+#
+EOF
+
+    return 1 ;
+}
+
+sub ValidProtoString ($)
+{
+    my($string) = @_ ;
+
+    if ( $string =~ /^$proto_re+$/ ) {
+        return $string ;
+    }
+
+    return 0 ;
+}
+
+sub C_string ($)
+{
+    my($string) = @_ ;
+
+    $string =~ s[\\][\\\\]g ;
+    $string ;
+}
+
+sub ProtoString ($)
+{
+    my ($type) = @_ ;
+
+    $proto_letter{$type} or "\$" ;
+}
+
 
 sub check_cpp {
     my @cpp = grep(/^\#\s*(?:if|e\w+)/, @line);
@@ -337,6 +562,8 @@ sub check_cpp {
 		$cpplevel++;
 	    } elsif (!$cpplevel) {
 		Warn("Warning: #else/elif/endif without #if in this function");
+		print STDERR "    (precede it with a blank line if the matching #if is outside the function)\n"
+		    if $XSStack[-1]{type} eq 'if';
 		return;
 	    } elsif ($cpp =~ /^\#\s*endif/) {
 		$cpplevel--;
@@ -349,86 +576,137 @@ sub check_cpp {
 
 sub Q {
     my($text) = @_;
-    $text =~ tr/#//d;
+    $text =~ s/^#//gm;
     $text =~ s/\[\[/{/g;
     $text =~ s/\]\]/}/g;
     $text;
 }
 
-open(F, $filename) or die "cannot open $filename: $!\n";
+open($FH, $filename) or die "cannot open $filename: $!\n";
 
 # Identify the version of xsubpp used
-print <<EOM ;
+print <<"EOF" ;
 /*
- * This file was generated automatically by xsubpp version $XSUBPP_version from the 
+ * This file was generated automatically by xsubpp version $VERSION from the
  * contents of $filename. Don't edit this file, edit $filename instead.
  *
- *	ANY CHANGES MADE HERE WILL BE LOST! 
+ *    ANY CHANGES MADE HERE WILL BE LOST!
  *
  */
 
-EOM
- 
+EOF
 
-while (<F>) {
+
+while (<$FH>) {
     last if ($Module, $Package, $Prefix) =
 	/^MODULE\s*=\s*([\w:]+)(?:\s+PACKAGE\s*=\s*([\w:]+))?(?:\s+PREFIX\s*=\s*(\S+))?\s*$/;
     print $_;
 }
 &Exit unless defined $_;
 
-my $lastline	= $_;
-my $lastline_no = $.;
+$lastline	= $_;
+$lastline_no = $.;
 
 
-# Read next xsub into @line from ($lastline, <F>).
+# Read next xsub into @line from ($lastline, <$FH>).
 sub fetch_para {
     # parse paragraph
     @line = ();
     @line_no = () ;
-    return 0 unless defined $lastline;
+    if (! defined $lastline) {
+        return 1 if PopFile() ;
+	death ("Error: Unterminated `#if/#ifdef/#ifndef'")
+	    if $XSStack[-1]{type} eq 'if';
+        return 0 ;
+    }
 
     if ($lastline =~
-	/^MODULE\s*=\s*([\w:]+)(?:\s+PACKAGE\s*=\s*([\w:]+))?(?:\s+PREFIX\s*=\s*(\S+))?\s*$/) {
-	$Module = $1;
-	$Package = defined($2) ? $2 : '';	# keep -w happy
-	$Prefix  = defined($3) ? $3 : '';	# keep -w happy
-	($Module_cname = $Module) =~ s/\W/_/g;
-	($Packid = $Package) =~ tr/:/_/;
-	$Packprefix = $Package;
-	$Packprefix .= "::" if $Packprefix ne "";
-	$lastline = "";
+      /^MODULE\s*=\s*([\w:]+)(?:\s+PACKAGE\s*=\s*([\w:]+))?(?:\s+PREFIX\s*=\s*(\S+))?\s*$/) {
+      $Module = $1;
+      $Package = defined($2) ? $2 : '';       # keep -w happy
+      $Prefix  = defined($3) ? $3 : '';       # keep -w happy
+      ($Module_cname = $Module) =~ s/\W/_/g;
+      ($Packid = $Package) =~ tr/:/_/;
+      $Packprefix = $Package;
+      $Packprefix .= "::" if defined $Packprefix && $Packprefix ne "";
+      $lastline = "";
     }
 
     for(;;) {
 	if ($lastline !~ /^\s*#/ ||
-	    $lastline =~ /^#[ \t]*(?:(?:if|ifn?def|else|elif|endif|define|undef|pragma)\b|include\s*["<].*[>"])/) {
-	    last if $lastline =~ /^\S/ && @line && $line[-1] eq "";
-	    push(@line, $lastline);
-	    push(@line_no, $lastline_no) ;
-	}
+	  # CPP directives:
+	  #	ANSI:	if ifdef ifndef elif else endif define undef
+	  #		line error pragma
+	  #	gcc:	warning include_next
+	  #   obj-c:	import
+	  #   others:	ident (gcc notes that some cpps have this one)
+	  $lastline =~ /^#[ \t]*(?:(?:if|ifn?def|elif|else|endif|define|undef|pragma|error|warning|line\s+\d+|ident)\b|(?:include(?:_next)?|import)\s*["<].*[>"])/) {
+          last if $lastline =~ /^\S/ && @line && $line[-1] eq "";
+          push(@line, $lastline);
+          push(@line_no, $lastline_no) ;
+      }
 
-	# Read next line and continuation lines
-	last unless defined($lastline = <F>);
-	$lastline_no = $.;
-	my $tmp_line;
-	$lastline .= $tmp_line
-	    while ($lastline =~ /\\$/ && defined($tmp_line = <F>));
-	    
-	chomp $lastline;
-	$lastline =~ s/^\s+$//;
+      # Read next line and continuation lines
+      last unless defined($lastline = <$FH>);
+      $lastline_no = $.;
+      my $tmp_line;
+      $lastline .= $tmp_line
+          while ($lastline =~ /\\$/ && defined($tmp_line = <$FH>));
+
+      chomp $lastline;
+      $lastline =~ s/^\s+$//;
     }
     pop(@line), pop(@line_no) while @line && $line[-1] eq "";
     1;
 }
 
+$Section = 'XSUB' ;
+
 PARAGRAPH:
 while (fetch_para()) {
     # Print initial preprocessor statements and blank lines
-    print shift(@line), "\n"
-	while @line && $line[0] !~ /^[^\#]/;
+    while (@line && $line[0] !~ /^[^\#]/) {
+      my $line = shift(@line);
+      print $line, "\n";
+      next unless $line =~ /^\#\s*((if)(?:n?def)?|elsif|else|endif)\b/;
+      my $statement = $+;
+      if ($statement eq 'if') {
+          $XSS_work_idx = @XSStack;
+          push(@XSStack, {type => 'if'});
+      } else {
+          death ("Error: `$statement' with no matching `if'")
+              if $XSStack[-1]{type} ne 'if';
+          if ($XSStack[-1]{varname}) {
+              push(@InitFileCode, "#endif\n");
+              push(@BootCode,     "#endif");
+          }
+
+          my(@fns) = keys %{$XSStack[-1]{functions}};
+          if ($statement ne 'endif') {
+              # Hide the functions defined in other #if branches, and reset.
+              @{$XSStack[-1]{other_functions}}{@fns} = (1) x @fns;
+              @{$XSStack[-1]}{qw(varname functions)} = ('', {});
+          } else {
+              my($tmp) = pop(@XSStack);
+              0 while (--$XSS_work_idx
+                       && $XSStack[$XSS_work_idx]{type} ne 'if');
+              # Keep all new defined functions
+              push(@fns, keys %{$tmp->{other_functions}});
+              @{$XSStack[$XSS_work_idx]{functions}}{@fns} = (1) x @fns;
+          }
+      }
+    }
 
     next PARAGRAPH unless @line;
+
+    if ($XSS_work_idx && !$XSStack[$XSS_work_idx]{varname}) {
+      # We are inside an #if, but have not yet #defined its xsubpp variable.
+      print "#define $cpp_next_tmp 1\n\n";
+      push(@InitFileCode, "#if $cpp_next_tmp\n");
+      push(@BootCode,     "#if $cpp_next_tmp");
+      $XSStack[$XSS_work_idx]{varname} = $cpp_next_tmp++;
+    }
+
 
     death ("Code is not inside a function")
 	if $line[0] =~ /^\s/;
@@ -443,50 +721,91 @@ while (fetch_para()) {
     undef($elipsis);
     undef($wantRETVAL) ;
     undef(%arg_list) ;
+    undef(@proto_arg) ;
+    undef($proto_in_this_xsub) ;
+    undef($scope_in_this_xsub) ;
+    $ProtoThisXSUB = $WantPrototypes ;
+    $ScopeThisXSUB = 0;
+
 
     $_ = shift(@line);
-    if (check_keyword("REQUIRE")) {
-        REQUIRE_handler() ; 
+    while ($kwd = check_keyword("REQUIRE|PROTOTYPES|VERSIONCHECK|INCLUDE")) {
+        &{"${kwd}_handler"}() ;
         next PARAGRAPH unless @line ;
         $_ = shift(@line);
     }
 
     if (check_keyword("BOOT")) {
 	&check_cpp;
-        push (@BootCode, $_, @line, "") ;
+	push (@BootCode, $_, @line, "") ;
         next PARAGRAPH ;
     }
-
 
     # extract return type, function name and arguments
     my($ret_type) = TidyType($_);
 
+    # Check for change of section
+    if ($ret_type =~ s/^(TYPE|XSUB|VAR)\s*//) {
+	$Section = $1 ;
+
+	if ($Section eq 'TYPE') {
+	    if ($ret_type =~ /^(SCALAR|ARRAY|HASH)/ ) 
+	        { $Section = $1 }
+	    else
+		{ death ("Error: Unknown section 'TYPE $ret_type'") }
+	}
+
+	next PARAGRAPH unless @line ;
+        $ret_type = shift(@line);
+    }
+
+    if ($Section eq 'SCALAR') {
+	blurt("TYPE SCALAR not implemented yet") ;
+        #ParseScalar ($ret_type, @line) ;
+	next PARAGRAPH ;
+    }
+    if ($Section eq 'HASH') {
+        ParseStructure ($ret_type, @line) ;
+        next PARAGRAPH ;
+    }
+    if ($Section eq 'ARRAY') {
+        ParseArray ($ret_type, @line) ;
+        next PARAGRAPH ;
+    }
+    
+    if ($Section eq 'VAR') {
+	ParseVar($ret_type, @line) ;
+	next PARAGRAPH ;
+    }
+  
+    # Default section is XSUB
+
     # a function definition needs at least 2 lines
     blurt ("Error: Function definition too short '$ret_type'"), next PARAGRAPH
-	unless @line ;
+      unless @line ;
 
     $static = 1 if $ret_type =~ s/^static\s+//;
 
     $func_header = shift(@line);
     blurt ("Error: Cannot parse function definition from '$func_header'"), next PARAGRAPH
-	unless $func_header =~ /^(?:([\w:]*)::)?(\w+)\s*\(\s*(.*?)\s*\)\s*$/s;
+      unless $func_header =~ /^(?:([\w:]*)::)?(\w+)\s*\(\s*(.*?)\s*\)\s*$/s;
 
     ($class, $func_name, $orig_args) =  ($1, $2, $3) ;
     ($pname = $func_name) =~ s/^($Prefix)?/$Packprefix/;
+    $Full_func_name = "${Packid}_$func_name";
 
     # Check for duplicate function definition
-    if (defined $Func_name{"${Packid}_$func_name"} ) {
-       Warn("Warning: duplicate function definition '$func_name' detected") 
+    for $tmp (@XSStack) {
+      next unless defined $tmp->{functions}{$Full_func_name};
+      Warn("Warning: duplicate function definition '$func_name' detected");
+      last;
     }
-    else {
-        push(@Func_name, "${Packid}_$func_name");
-        push(@Func_pname, $pname);
-    }
-    $Func_name{"${Packid}_$func_name"} ++ ;
+    $XSStack[$XSS_work_idx]{functions}{$Full_func_name} ++ ;
+    %XsubAliases = %XsubAliasValues = ();
 
     @args = split(/\s*,\s*/, $orig_args);
     if (defined($class)) {
-	my $arg0 = (defined($static) ? "CLASS" : "THIS");
+	my $arg0 = ((defined($static) or $func_name =~ /^new/) ? "CLASS" : "THIS");
 	unshift(@args, $arg0);
 	($orig_args = "$arg0, $orig_args") =~ s/^$arg0, $/$arg0/;
     }
@@ -507,6 +826,7 @@ while (fetch_para()) {
 		    $defaults{$args[$i]} = $2;
 		    $defaults{$args[$i]} =~ s/"/\\"/g;
 	    }
+	    $proto_arg[$i+1] = "\$" ;
     }
     if (defined($class)) {
 	    $func_args = join(", ", @args[1..$#args]);
@@ -516,7 +836,8 @@ while (fetch_para()) {
     @args_match{@args} = 1..@args;
 
     $PPCODE = grep(/^\s*PPCODE\s*:/, @line);
-    $ALIAS  = grep(/^\s*ALIAS\s*:/,  @line);
+    $CODE = grep(/^\s*CODE\s*:/, @line);
+    $ALIAS  = grep(/^\s*ALIAS\s*:/, @line);
 
     # print function header
     print Q<<"EOF";
@@ -527,6 +848,7 @@ EOF
     print Q<<"EOF" if $ALIAS ;
 #    dXSI32;
 EOF
+
     if ($elipsis) {
 	$cond = ($min_args ? qq(items < $min_args) : 0);
     }
@@ -545,7 +867,7 @@ EOF
     if ($ALIAS) 
       { print Q<<"EOF" if $cond }
 #    if ($cond)
-#       croak("Usage: %s($orig_args)", GvNAME(CvGV(cv)));
+#	croak("Usage: %s($orig_args)", GvNAME(CvGV(cv)));
 EOF
     else 
       { print Q<<"EOF" if $cond }
@@ -576,15 +898,18 @@ EOF
 	$retvaldone = 0;
 	$deferred = "";
 	%arg_list = () ;
-        $gotRETVAL = 0;
+	$gotRETVAL = 0;
 
-	&INPUT_handler;
-	my $kwd;
-	while ($kwd = check_keyword("INPUT|PREINIT")) {
-	    if ($kwd eq 'PREINIT') { &print_section; } else { &INPUT_handler; }
-	}
+	INPUT_handler() ;
+	process_keyword("INPUT|PREINIT|ALIAS|PROTOTYPE|SCOPE") ;
+
+      print Q<<"EOF" if $ScopeThisXSUB;
+#   ENTER;
+#   [[
+EOF
+
 	if (!$thisdone && defined($class)) {
-	    if (defined($static)) {
+	    if (defined($static) or $func_name =~ /^new/) {
 		print "\tchar *";
 		$var_types{"CLASS"} = "char *";
 		&generate_init("char *", 1, "CLASS");
@@ -598,7 +923,8 @@ EOF
 
 	# do code
 	if (/^\s*NOT_IMPLEMENTED_YET/) {
-		print "\ncroak(\"$pname: not implemented yet\");\n";
+		print "\n\tcroak(\"$pname: not implemented yet\");\n";
+		$_ = '' ;
 	} else {
 		if ($ret_type ne "void") {
 			print "\t" . &map_type($ret_type) . "\tRETVAL;\n"
@@ -607,22 +933,16 @@ EOF
 			$var_types{"RETVAL"} = $ret_type;
 		}
 		print $deferred;
-                while ($kwd = check_keyword("INIT|ALIAS")) {
-                    if ($kwd eq 'INIT') {
-                        &print_section
-                    }
-                    else {
-                        ALIAS_handler
-                    }
-                }
+                process_keyword("INIT|ALIAS|PROTOTYPE") ;
 
 		if (check_keyword("PPCODE")) {
-			&print_section;
+			print_section();
 			death ("PPCODE must be last thing") if @line;
+			print "\tLEAVE;\n" if $ScopeThisXSUB;
 			print "\tPUTBACK;\n\treturn;\n";
 		} elsif (check_keyword("CODE")) {
-			&print_section;
-		} elsif ($func_name eq "DESTROY") {
+			print_section() ;
+		} elsif (defined($class) and $func_name eq "DESTROY") {
 			print "\n\t";
 			print "delete THIS;\n";
 		} else {
@@ -638,10 +958,15 @@ EOF
 				print "${class}::";
 			    }
 			} elsif (defined($class)) {
-				print "THIS->";
+			    if ($func_name =~ /^new/) {
+				$func_name .= " $class";
+			    } else {
+  				print "THIS->";
+			    }
 			}
-			$func_name =~ s/^($spat)//
-			    if defined($spat);
+			if (defined($spat) && $func_name =~ /^($spat)(.*)$/) {
+				$func_name = $2;
+			}
 			print "$func_name($func_args);\n";
 		}
 	}
@@ -650,7 +975,7 @@ EOF
 	$gotRETVAL = 0;
 	undef $RETVAL_code ;
 	undef %outargs ;
-	&OUTPUT_handler while check_keyword("OUTPUT");
+        process_keyword("OUTPUT|ALIAS|PROTOTYPE"); 
 
 	# all OUTPUT done, so now push the return value on the stack
 	if ($gotRETVAL && $RETVAL_code) {
@@ -660,12 +985,20 @@ EOF
 	}
 
 	# do cleanup
-	&print_section while check_keyword("CLEANUP");
+	process_keyword("CLEANUP|ALIAS|PROTOTYPE") ;
+
+      print Q<<"EOF" if $ScopeThisXSUB;
+#   ]]
+EOF
+      print Q<<"EOF" if $ScopeThisXSUB and not $PPCODE;
+#   LEAVE;
+EOF
 
 	# print function trailer
 	print Q<<EOF;
 #    ]]
 EOF
+
 	print Q<<EOF if $except;
 #    BEGHANDLERS
 #    CATCHALL
@@ -687,18 +1020,77 @@ EOF
 #	croak(errbuf);
 EOF
 
-    print Q<<EOF unless $PPCODE;
+    if ($ret_type ne "void" or $CODE) {
+        print Q<<EOF unless $PPCODE;
 #    XSRETURN(1);
 EOF
+    } else {
+        print Q<<EOF unless $PPCODE;
+#    XSRETURN_EMPTY;
+EOF
+    }
+
 
     print Q<<EOF;
 #]]
 #
 EOF
+
+    my $newXS = "newXS" ;
+    my $proto = "";
+
+    # Build the prototype string for the xsub
+    if ($ProtoThisXSUB) {
+	$newXS = "newXSproto";
+
+        if ($ProtoThisXSUB == 2) {
+            # User has specified empty prototype
+            $proto = ', ""'
+        }
+        elsif ($ProtoThisXSUB != 1) {
+            # User has specified a prototype
+            $proto = ', "' . $ProtoThisXSUB . '"'
+        }
+        else {
+	    my $s = ';' ;
+            if ($min_args < $num_args) {
+	        $s = '' ;
+                $proto_arg[$min_args] .= ";" 
+	    }
+            push @proto_arg, "$s\@" 
+              if $elipsis ;
+    
+            $proto = ', "' . join ("", @proto_arg) . '"' 
+        }
+    }
+
+    if (%XsubAliases) {
+      $XsubAliases{$pname} = 0
+          unless defined $XsubAliases{$pname} ;
+      while ( ($name, $value) = each %XsubAliases) {
+          push(@InitFileCode, Q<<"EOF");
+#        cv = newXS(\"$name\", XS_$Full_func_name, file);
+#        XSANY.any_i32 = $value ;
+EOF
+      push(@InitFileCode, Q<<"EOF") if $proto;
+#        sv_setpv((SV*)cv$proto) ;
+EOF
+        }
+    }
+    else {
+      push(@InitFileCode,
+           "        ${newXS}(\"$pname\", XS_$Full_func_name, file$proto);\n");
+    }
+
 }
 
+# Generate code for handling variables.
+&VarCode ;
+
 # print initialization routine
-print qq/extern "C"\n/ if $cplusplus;
+##ifdef __cplusplus
+#extern "C"
+##endif
 print Q<<"EOF";
 #XS(boot_$Module_cname)
 #[[
@@ -707,33 +1099,43 @@ print Q<<"EOF";
 #
 EOF
 
-print Q<<"EOF" if defined %XsubAliases ;
+print Q<<"EOF" if $WantVersionChk ;
+#    XS_VERSION_BOOTCHECK ;
+#
+EOF
+
+print Q<<"EOF" if defined $XsubAliases ;
 #    {
 #        CV * cv ;
 #
 EOF
 
-for (@Func_name) {
-    $pname = shift(@Func_pname);
+print @InitFileCode;
 
-    if ($XsubAliases{$pname}) {
-        $XsubAliases{$pname}{$pname} = 0 
-		unless defined $XsubAliases{$pname}{$pname} ;
-        while ( ($name, $value) = each %{$XsubAliases{$pname}}) {
-            print Q<<"EOF" ;
-#        cv = newXS(\"$name\", XS_$_, file);
-#        XSANY.any_i32 = $value ;
-EOF
-        }
-    }
-    else {
-        print "        newXS(\"$pname\", XS_$_, file);\n";
-    }
-}
-
-print Q<<"EOF" if defined %XsubAliases ;
+print Q<<"EOF" if defined $XsubAliases ;
 #    }
 EOF
+
+if (@Inherit) {
+
+    print Q<<"EOF" ;
+
+#    [[ 
+#        SV * base_sv = newSVpv("${Cdata_perl}", 0) ;
+#
+EOF
+    foreach (@Inherit) 
+      { print qq#        av_push(perl_get_av("$_", TRUE), base_sv) ;\n# }
+    
+    print Q<<EOF ;
+#    ]]
+#
+#
+EOF
+
+}
+
+&TieVarCode ;
 
 if (@BootCode)
 {
@@ -742,14 +1144,18 @@ if (@BootCode)
     print "\n    /* End of Initialisation Section */\n\n" ;
 }
 
-print Q<<"EOF";;
+
+print Q<<"EOF";
+#
 #    ST(0) = &sv_yes;
 #    XSRETURN(1);
-#]]
+#}
 EOF
 
-&Exit;
-
+warn("Please specify prototyping behavior for $filename (see perlxs manual)\n") 
+    unless $ProtoUsed ;
+  
+&Exit ;
 
 sub output_init {
     local($type, $num, $init) = @_;
@@ -787,35 +1193,42 @@ sub generate_init {
 
     $type = TidyType($type) ;
     blurt("Error: '$type' not in typemap"), return 
-	unless defined($type_kind{$type});
+	unless defined($xsub_type_kind{$type});
 
     ($ntype = $type) =~ s/\s*\*/Ptr/g;
-    ($subtype = $ntype) =~ s/(?:Array)?(?:Ptr)?$//;
-    $tk = $type_kind{$type};
+    $subtype = $ntype;
+    $subtype =~ s/Ptr$//;
+    $subtype =~ s/Array$//;
+    $DataType = $subtype ;
+    $DataType =~ s/^\s*(struct|union)\s+// ;
+    $tk = $xsub_type_kind{$type};
     $tk =~ s/OBJ$/REF/ if $func_name =~ /DESTROY$/;
-    $type =~ tr/:/_/;
+    $type =~ s/:/_/g;
     blurt("Error: No INPUT definition for type '$type' found"), return
         unless defined $input_expr{$tk} ;
     $expr = $input_expr{$tk};
     if ($expr =~ /DO_ARRAY_ELEM/) {
         blurt("Error: '$subtype' not in typemap"), return 
-	    unless defined($type_kind{$subtype});
+          unless defined($xsub_type_kind{$subtype});
         blurt("Error: No INPUT definition for type '$subtype' found"), return
-            unless defined $input_expr{$type_kind{$subtype}} ;
-	$subexpr = $input_expr{$type_kind{$subtype}};
+            unless defined $input_expr{$xsub_type_kind{$subtype}} ;
+	$subexpr = $input_expr{$xsub_type_kind{$subtype}};
 	$subexpr =~ s/ntype/subtype/g;
 	$subexpr =~ s/\$arg/ST(ix_$var)/g;
 	$subexpr =~ s/\n\t/\n\t\t/g;
-	$subexpr =~ s/is not of (.*")/[arg %d] is not of $1, ix_$var + 1/g;
+	$subexpr =~ s/is not of (.*\")/[arg %d] is not of $1, ix_$var + 1/g;
 	$subexpr =~ s/\$var/${var}[ix_$var - $argoff]/;
 	$expr =~ s/DO_ARRAY_ELEM/$subexpr/;
+    }
+    if ($expr =~ m#/\*.*scope.*\*/#i) { # "scope" in C comments
+      $ScopeThisXSUB = 1;
     }
     if (defined($defaults{$var})) {
 	    $expr =~ s/(\t+)/$1    /g;
 	    $expr =~ s/        /\t/g;
 	    eval qq/print "\\t$var;\\n"/;
 	    $deferred .= eval qq/"\\n\\tif (items < $num)\\n\\t    $var = $defaults{$var};\\n\\telse {\\n$expr;\\n\\t}\\n"/;
-    } elsif ($expr !~ /^\t\$var =/) {
+    } elsif ($ScopeThisXSUB or $expr !~ /^\t\$var =/) {
 	    eval qq/print "\\t$var;\\n"/;
 	    $deferred .= eval qq/"\\n$expr;\\n"/;
     } else {
@@ -834,19 +1247,23 @@ sub generate_output {
 	    print "\tsv_setpvn($arg, (char *)$var, $2 * sizeof($1)), XFree((char *)$var);\n";
     } else {
 	    blurt("Error: '$type' not in typemap"), return
-		unless defined($type_kind{$type});
-            blurt("Error: No OUTPUT definition for type '$type' found"), return
-                unless defined $output_expr{$type_kind{$type}} ;
+		unless defined($xsub_type_kind{$type});
+	    blurt("Error: No OUTPUT definition for type '$type' found"), return
+		unless defined $output_expr{$xsub_type_kind{$type}} ;
 	    ($ntype = $type) =~ s/\s*\*/Ptr/g;
 	    $ntype =~ s/\(\)//g;
-	    ($subtype = $ntype) =~ s/(?:Array)?(?:Ptr)?$//;
-	    $expr = $output_expr{$type_kind{$type}};
+	    $subtype = $ntype;
+	    $subtype =~ s/Ptr$//;
+	    $subtype =~ s/Array$//;
+    	    $DataType = $subtype ;
+            $DataType =~ s/^\s*(struct|union)\s+// ;
+	    $expr = $output_expr{$xsub_type_kind{$type}};
 	    if ($expr =~ /DO_ARRAY_ELEM/) {
-	        blurt("Error: '$subtype' not in typemap"), return
-		    unless defined($type_kind{$subtype});
+                blurt("Error: '$subtype' not in typemap"), return
+                  unless defined($xsub_type_kind{$subtype});
                 blurt("Error: No OUTPUT definition for type '$subtype' found"), return
-                    unless defined $output_expr{$type_kind{$subtype}} ;
-		$subexpr = $output_expr{$type_kind{$subtype}};
+                    unless defined $output_expr{$xsub_type_kind{$subtype}} ;
+		$subexpr = $output_expr{$xsub_type_kind{$subtype}};
 		$subexpr =~ s/ntype/subtype/g;
 		$subexpr =~ s/\$arg/ST(ix_$var)/g;
 		$subexpr =~ s/\$var/${var}[ix_$var]/g;
@@ -855,11 +1272,16 @@ sub generate_output {
 		eval "print qq\a$expr\a";
 	    }
 	    elsif ($var eq 'RETVAL') {
-		if ($expr =~ /^\t\$arg = /) {
+		if ($expr =~ /^\t\$arg\s*=\s*\$var\s*;/) {
 		    eval "print qq\a$expr\a";
-		    print "\tsv_2mortal(ST(0));\n";
-		}
-		else {
+                  print "\tif (SvREFCNT(ST(0))) sv_2mortal(ST(0));\n";
+                } 
+                elsif ($expr =~ /^\t\$arg = /) {
+                  eval "print qq\a$expr\a";
+                  print "\tsv_2mortal(ST(0));\n";
+
+	        }
+	        else {
 		    print "\tST(0) = sv_newmortal();\n";
 		    eval "print qq\a$expr\a";
 		}
@@ -878,10 +1300,1748 @@ sub map_type {
     $type;
 }
 
+sub StackTie
+{
+    my ($type, $var) = @_ ;
+    DoStackTie("ST(0)", $type, $var) ;
+}
+
+sub DoStackTie
+{
+    my ($dest, $type, $var) = @_ ;
+    my ($pointer)    = 0 ;
+    my ($t) ;
+    my ($theVar)     =  $var ;
+    my ($type1)   ;
+    my ($length) = 1;
+
+    ($type1 = $type) =~ s/\s*\*+\s*// ;
+    if ($t = $C_DataTypes{$type}) {
+        $pointer = 0 
+    }
+    elsif ($t = $C_DataTypes{$type1}) {
+        $pointer = 1 
+    }
+    else
+      { return 0 }
+
+
+    $length = $t->{LENGTH} if $t->{LENGTH} ;
+
+    $theVar = "&$var" 
+	if $t->{TYPE} == $t_HASH and ! $pointer ;
+
+    print Q<<"EOF";
+#       sv_setsv($dest,
+#                Ref2Tied($t->{TYPE}, "$t->{PACKAGE}", 
+#                    	 sizeof($t->{CTYPE}), $length, $theVar, 0 )) ;
+EOF
+
+    return 1 ;
+}
+
+
+sub do_expr
+{
+    local ($expr) = @_ ;
+
+    $expr = qq# print "$expr# ;
+    $expr .= ' ;' unless $expr =~ /[;}]\s*$/ ;
+    $expr .= '"' . "\n" ;
+ 
+    eval $expr ;
+    checkEval $expr ;
+ 
+}
+
+sub gen_struct_STORE
+{
+    local ($type, $var, $key, $max) = @_ ;
+    local ($len) = length $key ;
+    local ($arg) = 'ST(2)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+
+    return 0
+	unless defined ($hash_type_kind{$type}) and
+	       defined $input_expr{$hash_type_kind{$type}} ;
+
+    do_expr($input_expr{$hash_type_kind{$type}}) ;
+    return 1 ;
+
+}
+
+
+sub gen_struct_FETCH
+{
+    local ($type, $var, $key, $max) = @_ ;
+    local ($len) = length $key ;
+    local ($arg) = 'ST(0)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+ 
+    return 0
+        unless defined ($hash_type_kind{$type}) and
+               defined $output_expr{$hash_type_kind{$type}} ;
+ 
+    do_expr($output_expr{$hash_type_kind{$type}}) ;
+    return 1 ;
+ 
+}
+
+
+sub gen_array_STORE
+{
+    local ($type, $var, $key, $max) = @_ ;
+    local ($arg) = 'ST(2)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+
+    return 0
+	unless defined ($array_type_kind{$type}) and
+	       defined $input_expr{$array_type_kind{$type}} ;
+
+    do_expr($input_expr{$array_type_kind{$type}}) ;
+    return 1 ;
+
+}
+
+
+sub gen_array_FETCH
+{
+    local ($type, $var, $key) = @_ ;
+    local ($arg) = 'ST(0)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+ 
+    return 0
+        unless defined ($array_type_kind{$type}) and
+               defined $output_expr{$array_type_kind{$type}} ;
+ 
+    do_expr($output_expr{$array_type_kind{$type}}) ;
+    return 1 ;
+ 
+}
+
+sub gen_scalar_STORE
+{
+    local ($type, $var) = @_ ;
+    local ($arg) = 'ST(2)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+
+    return 0
+	unless defined ($array_type_kind{$type}) and
+	       defined $input_expr{$array_type_kind{$type}} ;
+
+    do_expr($input_expr{$array_type_kind{$type}}) ;
+    return 1 ;
+}
+
+
+sub gen_scalar_FETCH
+{
+    local ($type, $var) = @_ ;
+    local ($arg) = 'ST(0)' ;
+ 
+    # just double check that the type is ok
+    $type = TidyType($type) ;
+ 
+    return 0
+        unless defined ($scalar_type_kind{$type}) and
+               defined $output_expr{$scalar_type_kind{$type}} ;
+ 
+    do_expr($output_expr{$scalar_type_kind{$type}}) ;
+    return 1 ;
+ 
+}
+
+sub DeStackTie
+{
+    my ($type, $var, $element) = @_ ;
+    my ($t) ;
+    my ($len) = length $element ;
+    my ($pointer) = 0 ;
+
+    my ($type1)   ;
+ 
+    ($type1 = $type) =~ s/\s*\*+\s*// ;
+    if ($t = $C_DataTypes{$type}) {
+        $pointer = 0
+    }
+    elsif ($t = $C_DataTypes{$type1}) {
+        $pointer = 1
+    }
+    else
+      { return 0 }
+
+ 
+    my ($pkg) = $t->{PACKAGE} ;
+    my ($ctype) = $t->{CTYPE} ;
+    my ($var1)  = $var ;
+    $var1 = "&$var1" 
+	if $t->{TYPE} == $t_HASH and ! $pointer ;
+
+    print Q<<"EOF";
+#        XS_cdata_info_t * info1 ;
+#
+#        if (sv_isa(ST(2), "$pkg"))
+#           info1 = GetInternalData(ST(2)) ;
+#        else
+#            croak("STORE - element not of type $pkg" ) ;
+EOF
+
+    print Q<<"EOF" if $pointer ;
+#
+#        /* zap the pointer into the data structure */
+#        $var = ($ctype *)info1->ptr ; 
+#
+#	 /* reference the other structure */
+#	 hv_store((HV*)info->refs, "$element", $len,  newSVsv(ST(2)), 0) ;
+#	 /* hv_store((HV*)info->refs, "$element", $len,  newRV(GetInternalObject(ST(2))), 0) ; */
+EOF
+ 
+
+    print Q<<"EOF" if ! $pointer ;
+#
+#        /* copy the complete data structure */
+#	 memcpy($var1, info1->ptr, sizeof($ctype)) ;
+EOF
+ 
+    return 1 ;
+}
+
+
+sub MkNewXS($$)
+{
+    my ($func, $name) = @_ ;
+
+    push (@InitFileCode, Q<<"EOF") ;
+#        newXS("$name", XS_$func, file);
+EOF
+}
+
+
+sub ParseVar
+{
+    my (@line) = @_ ;
+    my ($info) ;
+
+ OUTER:
+    while (@line)
+    {
+        $_ = shift(@line) ;
+
+        if ( /^\w/ ) {
+	    my ($varname, $type) = GetTypeAndName($_) ;
+
+            blurt ("Error: $varname definition already exists\n"), next OUTER
+	        if defined $Vars{$Package}{$varname} ;
+
+            $info =
+            $Vars{$Package}{$varname} = 
+                      { type	 => $type,
+			alias	 => [ ], 
+                        STORE    => [ ],
+                        FETCH    => [ ],
+			readable => 1,
+			writable => 1,
+			tailored => 0,
+                      } ;
+        }
+        else {
+            if (s/^\s+ACCESS\s*:\s*//) {
+		blurt("Error: unknown access type '$_'"), next OUTER
+		    unless  /^(wo|ro)/i ;
+                $info->{readable} = 0 if /^wo/i ;
+                $info->{writable} = 0 if /^ro/i ;
+	        $info->{tailored} = 1 ;
+            }
+            elsif (s/^\s+ALIAS\s*:\s*//) {
+                push (@{ $info->{alias} }, split (' '))  
+            }
+            elsif (s/^\s+(STORE|FETCH)\s*:\s*//) {
+	        $info->{tailored} = 1 ;
+                $method = $1 ;
+                if ($_) 
+                    { $info->{$method} = [ $_ ] }
+                else {
+                    while (@line) {
+                        $_ = shift(@line) ;
+		        if (/^\w/ or /^\s*(STORE|FETCH|ACCESS|ALIAS)/ ) {
+                            unshift(@line, $_) ;
+                            next OUTER ;
+                        }
+                        push (@{ $info->{$method} }, $_)  ;
+                    }
+                }
+            }
+            else {
+                blurt("Unknown option in Scalar: $_") ;
+            }
+        }
+
+    }
+
+    $MapPkg{$Package} = $Packid ;
+
+}
+
+
+sub VarCode
+{
+    return unless %Vars ;
+
+    foreach $pkg ( sort keys %Vars )
+    {
+
+        foreach $func_name ( qw(FETCH STORE addressof sizeof))
+        {
+	    MkNewXS("$MapPkg{$pkg}__Scalar_$func_name", 
+			"${pkg}::Scalar::$func_name");
+        }
+
+        print Q <<"EOF";
+#
+#XS(XS_$MapPkg{$pkg}__Scalar_FETCH)
+#[[
+#    dXSARGS;
+#    int value ;
+#    AV * refs = perl_get_av("${pkg}::Scalar::refs", FALSE) ;
+#
+#    if (items != 1)
+#        croak("Usage: ${pkg}::Scalar::FETCH(n)") ;
+#
+#    if (sv_isa(ST(0), "${pkg}::Scalar"))
+#        value = (int) SvIV((SV*)SvRV(ST(0)));
+#    else
+#        croak("value is not of type ${pkg}::Scalar");
+#
+#    /* fprintf(stderr, "In ${pkg}::Scalar::FETCH - items %d, value %d\\n", items, value) ; */
+#
+#    ST(0) = sv_newmortal();
+#    switch (value)
+#    [[
+EOF
+
+        $i = 1 ;
+        foreach $var (sort keys %{$Vars{$pkg}}) 
+        {
+	    my $type = $Vars{$pkg}{$var}{type} ;
+
+	    # Don't create any methods if not tailored AND is a struct/array
+	    next
+	        unless $Vars{$pkg}{$var}{tailored} or !$C_DataTypes{$type} ;
+
+            print Q<<"EOF" ;
+#      case $i: /* $type $var */
+EOF
+	    if (! $Vars{$pkg}{$var}{readable}  )
+	  { print Q<<"EOF" }
+#        croak("Scalar \$$var cannot be read") ;
+EOF
+	    elsif (@{ $Vars{$pkg}{$var}{FETCH} }) {
+                foreach (@{ $Vars{$pkg}{$var}{FETCH} }) 
+                  { print Q<<"EOF" }
+#        $_
+EOF
+            }
+            else {
+	      StackTie($type, $var)  or
+	      &generate_output($type, 0, $var)
+	    }
+
+            print Q<<"EOF" ;
+#        break ;
+EOF
+	    ++ $i ;
+        }
+
+        print Q<<"EOF";
+#      default: croak ("In FETCH - unknown value, %d", value) ;
+#    ]]
+#    XSRETURN(1);
+#]]
+#
+#
+#XS(XS_$MapPkg{$pkg}__Scalar_STORE)
+#[[
+#    dXSARGS;
+#    int value ;
+#    AV * refs = perl_get_av("${pkg}::Scalar::refs", FALSE) ;
+#
+#    if (items != 2)
+#        croak("Usage: ${pkg}::Scalar::STORE(n)") ;
+#
+#    if (sv_isa(ST(0), "${pkg}::Scalar"))
+#        value = (int) SvIV((SV*)SvRV(ST(0)));
+#    else
+#        croak("value is not of type ${pkg}::Scalar");
+#
+#    /* fprintf(stderr, "In ${pkg}::Scalar::STORE - items %d, value %d\\n", items, value) ; */
+#
+#    ST(0) = sv_newmortal();
+#    switch (value)
+#    [[
+EOF
+ 
+        $i = 1 ;
+        foreach $var (sort keys %{$Vars{$pkg}})
+        {
+	    my $type = $Vars{$pkg}{$var}{type} ;
+
+	    # Don't create any methods if not tailored AND is a struct/array
+	    next
+	        unless $Vars{$pkg}{$var}{tailored} or !$C_DataTypes{$type} ;
+
+            print Q<<"EOF" ;
+#      case $i: /* $type $var */
+EOF
+	    if (! $Vars{$pkg}{$var}{writable}  )
+	      { print Q<<"EOF" }
+#        croak("Scalar \$$var is read-only") ;
+EOF
+	    elsif (@{ $Vars{$pkg}{$var}{STORE} }) {
+                foreach (@{ $Vars{$pkg}{$var}{STORE} }) 
+                  { print Q<<"EOF" }
+#        $_
+EOF
+            }
+	    else
+              { &generate_init($type, 2, $var) }
+            print Q<<"EOF" ;
+#        break ;
+EOF
+            ++ $i ;
+        }
+ 
+        print Q<<"EOF";
+#      default: croak ("In STORE - unknown value, %d", value) ;
+#    ]]
+#    XSRETURN(1);
+#]]
+#
+#XS(XS_$MapPkg{$pkg}__Scalar_addressof)
+#[[
+#    dXSARGS;
+#    int value ;
+#
+#    if (items != 1)
+#        croak("Usage: ${pkg}::Scalar::addressof(n)") ;
+#
+#    if (sv_isa(ST(0), "${pkg}::Scalar"))
+#        value = (int) SvIV((SV*)SvRV(ST(0)));
+#    else
+#        croak("value is not of type ${pkg}::Scalar");
+#
+#    /* fprintf(stderr, "In ${pkg}::Scalar::addressof - items %d, value %d\\n", item
+s, value) ; */
+#
+#    ST(0) = sv_newmortal();
+#    switch (value)
+#    [[
+EOF
+
+ 
+        $i = 1 ;
+        foreach $var (sort keys %{$Vars{$pkg}})
+        {
+	    my $type = $Vars{$pkg}{$var}{type} ;
+
+	    # Don't create any methods if not tailored AND is a struct/array
+	    next
+	        unless $Vars{$pkg}{$var}{tailored} or !$C_DataTypes{$type} ;
+
+            print Q<<"EOF" ;
+#      case $i: /* $type $var */
+#        sv_setiv(ST(0), (IV)&$var) ;
+#        break ;
+EOF
+            ++ $i ;
+        }
+ 
+        print Q<<"EOF";
+#      default: croak ("In addressof - unknown value, %d", value) ;
+#    ]]
+#    XSRETURN(1);
+#]]
+#
+#XS(XS_$MapPkg{$pkg}__Scalar_sizeof)
+#[[
+#    dXSARGS;
+#    int value ;
+#
+#    if (items != 1)
+#        croak("Usage: ${pkg}::Scalar::sizeof(n)") ;
+#
+#    if (sv_isa(ST(0), "${pkg}::Scalar"))
+#        value = (int) SvIV((SV*)SvRV(ST(0)));
+#    else
+#        croak("value is not of type ${pkg}::Scalar");
+#
+#    /* fprintf(stderr, "In ${pkg}::Scalar::sizeof - items %d, value %d\\n", item s, value) ; */
+#
+#    ST(0) = sv_newmortal();
+#    switch (value)
+#    [[
+EOF
+ 
+        $i = 1 ;
+        foreach $var (sort keys %{$Vars{$pkg}})
+        {
+	    my $type = $Vars{$pkg}{$var}{type} ;
+
+	    # Don't create any methods if not tailored AND is a struct/array
+	    next
+	        unless $Vars{$pkg}{$var}{tailored} or !$C_DataTypes{$type} ;
+
+            print Q<<"EOF" ;
+#      case $i: /* $type $var */
+#        sv_setiv(ST(0), (IV)sizeof($var)) ;
+#        break ;
+EOF
+            ++ $i ;
+        }
+ 
+        print Q<<"EOF";
+#      default: croak ("In sizeof - unknown value, %d", value) ;
+#    ]]
+#    XSRETURN(1);
+#]]
+#
+
+EOF
+
+
+    }
+
+
+    print Q<<"EOF";
+#static void
+#DoTieScalar(package, alias, index)
+#char * package ;
+#char * alias ;
+#int index ;
+#[[
+#    SV * sv ;
+#    SV * rv = sv_newmortal() ;
+#
+#    rv = sv_setref_iv(rv, package, index) ;
+#
+#    sv = perl_get_sv(alias, TRUE);
+#
+#    sv_magic(sv, rv, 'q', Nullch, 0);
+#
+#]]
+#
+EOF
+
+}
+
+
+sub TieVarCode
+{
+    return unless %Vars ;
+
+    my ($info) ;
+
+    foreach $pkg (sort keys %Vars) {
+        # create an array that the variables can use to store 
+        #
+	print Q<<"EOF" ;
+#    /* Create an Array to hold any context information */
+#    perl_get_av("${pkg}::Scalar::refs", TRUE) ;
+#
+EOF
+
+	# Now create some variables
+        my ($i) = 1 ;
+	my ($type) ;
+        foreach $var (sort keys %{$Vars{$pkg}}) {
+	    my $info = $Vars{$pkg}{$var} ;
+	    $type = $info->{type} ;
+            $info->{alias} = [ $var ] 
+                unless @{ $info->{alias} } ;
+
+            foreach $alias (@{$info->{alias}}) {
+                print Q<<"EOF" ;
+#
+#    /* $type $var */
+EOF
+                print Q<<"EOF" if $info->{tailored} or !$C_DataTypes{$type} ;
+#    DoTieScalar("${pkg}::Scalar", "${pkg}::$alias", $i) ;
+EOF
+
+                if ($C_DataTypes{$type}) { 
+		    my $create = 'TRUE' ;
+		    $create = 'FALSE' if $info->{tailored} ;
+		    DoStackTie(qq[perl_get_sv("${pkg}::$alias", $create)], 
+				$type, $var) ;
+		}
+            }
+            ++ $i 
+                if $info->{tailored} or !$C_DataTypes{$type} ;
+        }
+    }
+ 
+}
+
+sub GetTypeAndName
+{
+    my ($line) = @_ ;
+    my (@type, $varname) ;
+    my ($copy) = $line ;
+    my ($array_size) ;
+    my ($got_array) = 0 ;
+
+    # remove leading & trailing whitespace
+    TrimWhitespace($line) ;
+ 
+    # and any trailing semicolons too
+    $line =~ s/\s*;+\s*$//go ;
+ 
+    # check for trailing [nn]
+    if ($line =~ s/\s*\[([^\]]*)\]$// ) {
+	$got_array = 1 ;
+    	$array_size = $1 ;
+    }
+
+    # Now split to get the type & the variable
+    (@type) = split(' ', $line) ;
+    #(@type) = split(/\W+/, $line) ;
+ 
+    # type + variable means at least 2 words on the line
+    blurt("Expected type & variable, only got 1 in line '$copy'")
+	unless @type >= 2 ;
+ 
+    # The variable name is the rightmost word
+    $varname = pop @type ;
+ 
+    # move any *'s which may be attached to the variable back to the type
+    push (@type, $1) 
+	if $varname =~ s/^(\*+)// ;
+
+    # check for invalid variable
+    blurt("Error: invalid variable name '$varname' in line '$copy'")
+	unless ($varname =~ m/^&?\w+$/);
+
+    # and invalid type <<TODO
+    #blurt("")
+    #	unless ;
+
+    push(@type, '[]') if $got_array ;
+
+    # return rationalised type & variable name
+    ($varname, TidyType("@type"), $array_size) ;
+}
+
+sub ParseStructure
+{
+    my ($struct_name, @line) = @_ ;
+    my (%struct) ;
+    my (@struct) ;
+    my (%tailor) ;
+    my (%elements) ;
+    my (%methods) ;
+
+    blurt ("Error: No structure definition for $struct_name"), return
+	unless @line ;
+
+    # remove any trailing {
+    $struct_name =~ s/\s*{\s*$// ;
+
+    # trim whitespace
+    TrimWhitespace($struct_name) ;
+    $struct_type = $struct_name ;
+ 
+    # fatal error if no structure name present
+    die "missing structure name"
+	unless $struct_name ;
+ 
+    $xsub_type_kind{$struct_name} = "T_STRUCT_REF" ;
+    $xsub_type_kind{"$struct_name *"} = "T_STRUCT_REF_PTR" ;
+
+    # from the Perl perspective the structure type doesn't need
+    # the struct or union words, so remove them.
+    $struct_name =~ s/^\s*(struct|union)\s+// ;
+
+    # Remember the name of the data type & the package it lives in
+    $C_DataTypes{$struct_name}{PACKAGE}  = "${Package}::$struct_name" ;
+    $C_DataTypes{$struct_name}{TYPE}     = $t_HASH ;
+    $C_DataTypes{$struct_name}{CTYPE}    = $struct_type ;
+
+    $StructKeywords = '^\s*(FETCH|STORE|ADDRESSOF|SIZEOF|ACCESS|NEW|LENGTHOF|DESTROY)\s*:' ;
+
+    # First parse the structure definition
+    while (@line) {
+	last 
+	    if $line[0] =~ /$StructKeywords/o ;
+
+        $_ = shift(@line) ;
+
+	s/^\s*{\s*// ;
+	s/\s*}\s*;?\s*$// ;
+        next if /^\s*$/ ;
+
+	#my ($decl, $init) = split(/\s*=\s*/, $_, 2) ;
+        #($type, $name) = GetTypeAndName ($decl) ;
+        ($name, $type, $max) = GetTypeAndName ($_) ;
+        $struct{$name} = $type ;
+        push (@struct, $name) ;
+        $type =~ s/^\s*(struct|union)\s+// ;
+        $struct1{$name} = $type ;
+	$elements{$name}{init} = TrimWhitespace($init) if $init ;
+	$elements{$name}{max} = $max if defined $max ;
+
+	# default is read/write
+        $elements{$name}{readable} = 1 ;
+        $elements{$name}{writable} = 1 ;
+    }
+
+
+    # Now check for any tailoring of default methods
+    while (@line) {
+
+        $_ = shift(@line) ;
+
+	if (s/^$StructKeywords//o) {
+
+	    my $method = $1 ;
+
+	    # The per-element methods must have an element name
+	    if ($method eq 'FETCH' or $method eq 'STORE') {
+	        # Get the element name to tailor
+	        ($element, $rest) = split (' ', $_, 2) ;
+	        die ("unknown element '$element' in structure $struct_name\n")
+		    unless $struct1{$element} ;
+
+		# check that we havn't already defined a FETCH or STORE for
+		# this element
+		blurt("Error: Duplicate $method for $struct_type element $element")
+		    if defined @{$elements{$element}{$method}} ;
+	        push(@{$elements{$element}{$method}}, $rest) if $rest ;
+		$ref = \@{$elements{$element}{$method}} ;
+	    }
+	    elsif ( $method eq 'ACCESS') {
+		# format is ACCESS: [ro|wo] element [element...]
+                my $readable = 1 ;
+                my $writable = 1 ;
+	        my($access, @elements) = split (' ', $_) ;
+		# read only or write only?
+		blurt("Error: unknown access type '$access'"), next
+		    unless $access =~ /^\s*(wo|ro)/i ;
+                $readable = 0 if $access =~ /^\s*wo/i ;
+                $writable = 0 if $access =~ /^\s*ro/i ;
+		Warn("Warning: No element names supplied for ACCESS:"), next
+		    unless $access =~ /^\s*(wo|ro)/i ;
+		# check that each element exists
+		foreach (@elements) {
+	            blurt ("Error: Unknown element '$_' in structure $struct_name")
+		        unless $struct1{$_} ;
+	            $elements{$element}{readable} = $readable ;
+	            $elements{$element}{writable} = $writable ;
+		}
+	    }
+	    else {
+	        push( @{$methods{$method}}, $_) if $_ ;
+	    	$ref = \@{$methods{$method}} ;
+	    }
+
+	    push (@{$ref}, shift @line )
+                while @line and $line[0] !~ /$StructKeywords/o ;
+	    
+	}
+	else {
+	    die("Unknown Method line '$_'\n") ;
+	}
+    }
+
+
+    &OutputStandard ;
+
+    # write code for constructor/destructor & misc methods.
+    print Q<<"EOF";
+#
+#XS(XS_${Packid}__${struct_name}_new)
+#[[
+#    dXSARGS;
+#
+#    if (items < 0 || items > 2)
+#        croak("Usage: ${Package}::${struct_name}::new([pointer])") ;
+#
+# 
+#    ST(0) =  Ref2Tied($t_HASH, "${Package}::$struct_name",
+#                          sizeof($struct_type), 1,
+#                          (items == 2 ? (void*)SvIV(ST(1)) : NULL), 0
+#                         ) ;
+EOF
+    foreach $element (@struct) {
+	# per element new code could go here	
+    }
+    print Q<<"EOF";
+#    XSRETURN(1);
+#]]
+#
+EOF
+
+    push (@Inherit, "${Package}::${struct_name}::ISA");
+
+    foreach $func_name ( qw( new FETCH STORE ))
+    {
+        MkNewXS("${Packid}__${struct_name}_$func_name", 
+		"${Package}::${struct_name}::$func_name");
+    }
+
+
+    foreach $method ( qw( DESTROY clone sizeof addressof lengthof))
+    {
+	if ($methods{uc $method}) {
+	    $code = join ("\n    ", @{$methods{uc $method}}) . "\n" ;
+            PrintMethod ($method, "${Packid}__$struct_name", 
+			 "${Package}::$struct_name", $code)  ;
+	
+            MkNewXS("${Packid}__${struct_name}_$method", 
+		    "${Package}::${struct_name}::$method");
+	}
+    }
+
+
+    # Now write the FETCH/STORE methods for each element of the structure
+    # first FETCH
+    print Q<<"EOF";
+#XS(XS_${Packid}__${struct_name}_FETCH)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $struct_type * var ;
+#    char * key ;
+#
+#    if (items != 2)
+#        croak("Usage: ${Package}::${struct_name}::FETCH(var, key)") ;
+#
+#    if (sv_isa(ST(0), "${Package}::${struct_name}" )) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${struct_name}") ;
+#
+#    var = ($struct_type *) info->ptr ;
+#    key = SvPV(ST(1), na) ;
+#
+#    /* fprintf(stderr, "In ${Package}::${struct_name}::FETCH - items %d, key = %s ref = 0x%x\\n", items, key, SvRV(ST(0))) ; */
+#
+#    ST(0) = sv_newmortal();
+EOF
+
+    $if = 'if' ;
+    foreach $element (@struct) {
+
+	$type = $struct1{$element} ;
+        print Q<<"EOF";
+#    $if (strEQ(key, "$element")) { /* $struct{$element} $element */
+EOF
+	if (!$elements{$element}{readable}) {
+            print Q<<"EOF";
+#    croak("element '$element' is write-only") ;
+EOF
+	}
+	elsif ($elements{$element}{FETCH}) {
+	    foreach (@{ $elements{$element}{FETCH} }) {
+                print Q<<"EOF";
+#       $_
+EOF
+	    }
+	}
+        else {
+	    StackTie($type, "var->$element") or
+	    gen_struct_FETCH($type, "var->$element", $element, 
+				$elements{$element}{max}) or
+	    &generate_output($struct1{$element}, 0, "var->$element") 
+	}
+        
+        print Q<<"EOF";
+#    }
+EOF
+        $if = 'else if' ;
+    }
+
+    print Q<<"EOF";
+#    else 
+#        croak ("Unknown element '%s' in structure '${Package}::${struct_name}'", key ) ;
+#
+#    XSRETURN(1);
+#
+#]]
+#
+#XS(XS_${Packid}__${struct_name}_STORE)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $struct_type * var ;
+#    char * key ;
+#
+#
+#    if (items != 3)
+#        croak("Usage: ${Package}::${struct_name}::STORE(var, key, value)" ) ;
+#
+#    if (sv_isa(ST(0), "${Package}::${struct_name}")) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${struct_name}" ) ;
+#
+#    var = ($struct_type *) info->ptr ;
+#    key = SvPV(ST(1), na) ;
+#
+#    /* fprintf(stderr, "In ${Package}::${struct_name}::STORE - items %d, key = %s, ref = 0x%X, info = %X, ptr = %X\\n", items, key, SvRV(ST(0)), info, var) ; */
+#
+EOF
+
+    $if = 'if' ;
+    foreach $element (@struct) {
+	$type = $struct1{$element} ;
+        print Q<<"EOF";
+#    $if (strEQ(key, "$element")) { /* $struct{$element} $element */
+EOF
+	if (!$elements{$element}{writable}) {
+            print Q<<"EOF";
+#    croak("element '$element' is read-only") ;
+EOF
+	}
+        elsif ($elements{$element}{STORE}) {
+            foreach (@{ $elements{$element}{STORE} }) {
+        print Q<<"EOF";
+#       $_
+EOF
+            }
+        }
+        else {
+	    DeStackTie($type, "var->$element", $element)  or
+	    gen_struct_STORE($type, "var->$element", $element, 
+				$elements{$element}{max})  or
+            &generate_init($struct{$element}, 3, "var->$element")  ;
+	}
+
+        print Q<<"EOF";
+#    }
+EOF
+        $if = 'else if' ;
+    }
+
+    print Q<<"EOF";
+#    else
+#        croak ("Unknown element '%s' in structure '${Package}::${struct_name}'", key) ;
+#
+#    XSRETURN(1);
+#
+#]]
+#
+EOF
+
+}
+
+sub ParseArray
+{
+    my ($array_defn, @line) = @_ ;
+    my (%array_methods, $array_type, $array_name) ;
+    my ($array_size) ;
+    my $readable = 1 ;
+    my $writable = 1 ;
+
+    #print STDERR "In ParseArray\n" ;
+
+    # get the type & name
+    ($array_name, $array_type, $array_size) = GetTypeAndName($array_defn) ;
+    #warn "  Type - [$array_type] Name - [$array_name] Size - [$array_size]\n" ;
+
+
+    # TEMP - remove the [] from the type
+    $array_type =~ s/\s*\[\]\s*$// ;
+
+    # Remember the name of the array
+    $C_DataTypes{$array_name}{PACKAGE}  = "${Package}::$array_name" ;
+    $C_DataTypes{$array_name}{TYPE}     = $t_ARRAY ;
+    $C_DataTypes{$array_name}{CTYPE}    = $array_type ;
+    $C_DataTypes{$array_name}{LENGTH}   = $array_size if $array_size;
+
+    $xsub_type_kind{$array_name} = "T_ARRAY_REF" ;
+    $xsub_type_kind{"$array_name *"} = "T_ARRAY_REF_PTR" ;
+
+    $ArrayKeywords = '^\s*(FETCH|STORE|ADDRESSOF|SIZEOF|ACCESS|NEW|LENGTHOF|DESTROY)\s*:' ;
+
+    # Now check for any tailoring of default methods
+    while (@line) {
+
+        $_ = shift(@line) ;
+
+	if (s/^$ArrayKeywords//o) {
+
+	    my $method = $1 ;
+
+	    if ( $method eq 'ACCESS') {
+		# format is ACCESS: [ro|wo] 
+		# read only or write only?
+		blurt("Error: unknown access type '$_'"), next
+		    unless /^\s*(wo|ro)/i ;
+                $readable = 0 if /^\s*wo/i ;
+                $writable = 0 if /^\s*ro/i ;
+	    }
+	    else {
+	        push( @{$array_methods{$method}}, $_) if $_ ;
+	    	$ref = \@{$array_methods{$method}} ;
+	    }
+
+	    push (@{$ref}, shift @line )
+                while @line and $line[0] !~ /$ArrayKeywords/o ;
+	}
+	else {
+	    die("Unknown Method line '$_'\n") ;
+	}
+    }
+
+
+    &OutputStandard ;
+
+    # write code for constructor/destructor & misc methods.
+    print Q<<"EOF";
+#
+#XS(XS_${Packid}__${array_name}_new)
+#[[
+#    dXSARGS;
+#
+#    if (items < 0 || items > 2)
+#        croak("Usage: ${Package}::${array_name}::new([pointer])") ;
+#
+# 
+#     ST(0) = Ref2Tied($t_ARRAY, "${Package}::$array_name",
+#                          sizeof($array_type) , $array_size,
+#                          (items == 2 ? (void*)SvIV(ST(1)) : NULL), 0
+#                         ) ;
+#    XSRETURN(1);
+#]]
+#
+#
+EOF
+
+    push (@Inherit, "${Package}::${array_name}::ISA");
+
+    foreach $func_name ( qw( new FETCH STORE ))
+    {
+        MkNewXS("${Packid}__${array_name}_$func_name", 
+		"${Package}::${array_name}::$func_name");
+    }
+
+
+    foreach $method ( qw( DESTROY clone sizeof addressof lengthof))
+    {
+	if ($methods{uc $method}) {
+	    $code = join ("\n    ", @{$methods{uc $method}}) . "\n" ;
+            PrintMethod ($method, "${Packid}__$array_name", 
+			 "${Package}::$array_name", $code)  ;
+	
+            MkNewXS("${Packid}__${array_name}_$method", 
+		    "${Package}::${array_name}::$method");
+	}
+    }
+
+    # Now write the FETCH/STORE methods for each element of the structure
+    # first FETCH
+    print Q<<"EOF";
+#XS(XS_${Packid}__${array_name}_FETCH)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $array_type * var ;
+#    int  key ;
+#
+#    if (items != 2)
+#        croak("Usage: ${Package}::${array_name}::FETCH(var, key)") ;
+#
+#    if (sv_isa(ST(0), "${Package}::${array_name}")) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${array_name}") ;
+#
+#    var = ($array_type*) info->ptr ;
+#    key = SvIV(ST(1)) ;
+#
+#    /* check attempt to read off the end of the array */
+#    if (key+1 > info->count || key < 0)
+#        croak("index %d is not in range [0..%d]", key, info->count - 1) ;
+#
+#    /* fprintf(stderr, "In ${Package}::${array_name}::FETCH - items %d, key = %s\\n", items, key) ; */
+#
+#    ST(0) = sv_newmortal();
+EOF
+
+	if (! $readable) {
+	    print Q<<EOM ;
+#    croak("array is write-only") ;
+EOM
+	}
+        elsif ($array_methods{FETCH}) {
+	    foreach (@{ $array_methods{FETCH} }) {
+                print Q<<"EOF";
+#       $_
+EOF
+	    }
+	}
+        else {
+	    StackTie($array_type, "var[key]") or
+	    gen_array_FETCH($array_type, "var[key]", "key", $array_size) or
+	    &generate_output($array_type, 0, "var[key]") 
+	}
+        
+        print Q<<"EOF";
+#
+#    XSRETURN(1);
+#
+#]]
+#
+#XS(XS_${Packid}__${array_name}_STORE)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $array_type * var ;
+#    int  key ;
+#
+#
+#    if (items != 3)
+#        croak("Usage: ${Package}::${array_name}::STORE(var, key, value)") ;
+#
+#    if (sv_isa(ST(0), "${Package}::${array_name}")) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${array_name}") ;
+#
+#    var = ($array_type *) info->ptr ;
+#    key = SvIV(ST(1)) ;
+#
+#    /* check attempt to write off the end of the array */
+#    if (key+1 > info->count || key < 0)
+#        croak("index %d is not in range [0..%d]", key, info->count - 1) ;
+#
+#    /* fprintf(stderr, "In ${Package}::${array_name}::STORE - items %d, key = %s, info = %X, ptr = %X\\n", items, key, info, var) ; */
+#
+EOF
+
+	if (! $writable) {
+	    print Q<<EOM ;
+#    croak("array is read-only") ;
+EOM
+	}
+        elsif ($array_methods{STORE}) {
+            foreach (@{ $array_methods{STORE} }) {
+        print Q<<"EOF";
+#       $_
+EOF
+            }
+        }
+	else {
+	    DeStackTie($array_type, "var[key]", "key")  or
+	    gen_array_STORE($array_type, "var[key]", 'key', $array_size)  or
+            &generate_init($array_type, 3, "var[key]")  ;
+	}
+
+        print Q<<"EOF";
+#
+#    XSRETURN(1);
+#
+#]]
+#
+EOF
+
+}
+
+
+sub ParseScalar
+{
+    my ($scalar_defn, @line) = @_ ;
+    my (%scalar_methods, $scalar_type, $scalar_name) ;
+    my $readable = 1 ;
+    my $writable = 1 ;
+
+    print STDERR"In ParseScalar\n" ;
+
+    # Now get the type & name
+    ($scalar_type, $scalar_type) = GetTypeAndName($scalar_defn) ;
+    print STDERR "    Type - [$scalar_type] Name - [$scalar_name]\n" ;
+
+
+    # Remember the name of the scalar
+    $C_DataTypes{$scalar_name}{PACKAGE}  = "${Package}::$scalar_name" ;
+    $C_DataTypes{$scalar_name}{TYPE}     = $t_SCALAR ;
+    $C_DataTypes{$scalar_name}{CTYPE}    = $scalar_type ;
+
+    $ScalarKeywords = '^\s*(FETCH|STORE|ADDRESSOF|SIZEOF|ACCESS|NEW|LENGTHOF|DESTROY)\s*:' ;
+
+    # Now check for any tailoring of default methods
+    while (@line) {
+
+        $_ = shift(@line) ;
+
+	if (s/^$ScalarKeywords//o) {
+
+	    my $method = $1 ;
+
+	    if ( $method eq 'ACCESS') {
+		# format is ACCESS: [ro|wo] 
+		# read only or write only?
+		blurt("Error: unknown access type '$_'"), next
+		    unless /^\s*(wo|ro)/i ;
+                $readable = 0 if /^\s*wo/i ;
+                $writable = 0 if /^\s*ro/i ;
+	    }
+	    else {
+	        push( @{$scalar_methods{$method}}, $_) if $_ ;
+	    	$ref = \@{$scalar_methods{$method}} ;
+	    }
+
+	    push (@{$ref}, shift @line )
+                while @line and $line[0] !~ /$ScalarKeywords/o ;
+	}
+	else {
+	    die("Unknown Method line '$_'\n") ;
+	}
+    }
+
+    &OutputStandard ;
+
+    # write code for constructor/destructor & misc methods.
+    print Q<<"EOF";
+#
+#XS(XS_${Packid}__${scalar_name}_new)
+#[[
+#    dXSARGS;
+#
+#    if (items < 0 || items > 2)
+#        croak("Usage: ${Package}::${scalar_name}::new([pointer])") ;
+#
+# 
+#     ST(0) = Ref2Tied($t_SCALAR, "${Package}::$scalar_name",
+#                          sizeof($scalar_type), 1,
+#                          (items == 2 ? (void*)SvIV(ST(1)) : NULL), 0
+#                         ) ;
+#    XSRETURN(1);
+#]]
+#
+#
+EOF
+
+    push (@Inherit, "${Package}::${scalar_name}::ISA");
+
+    foreach $func_name ( qw( new FETCH STORE ))
+    {
+        MkNewXS("${Packid}__${scalar_name}_$func_name",
+        	"${Package}::${scalar_name}::$func_name");
+    }
+
+
+    foreach $method ( qw( DESTROY clone sizeof addressof lengthof))
+    {
+	if ($methods{uc $method}) {
+	    $code = join ("\n    ", @{$methods{uc $method}}) . "\n" ;
+            PrintMethod ($method, "${Packid}__$scalar_name", 
+			 "${Package}::$scalar_name", $code)  ;
+	
+            MkNewXS("${Packid}__${scalar_name}_$method",
+            	    "${Package}::${scalar_name}::$method");
+	}
+    }
+
+    # Now write the FETCH/STORE methods for each element of the structure
+    # first FETCH
+    print Q<<"EOF";
+#XS(XS_${Packid}__${scalar_name}_FETCH)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $scalar_type * var ;
+#
+#    if (items != 1)
+#        croak("Usage: ${Package}::${scalar_name}::FETCH(var)") ;
+#
+#    if (sv_isa(ST(0), "${Package}::${scalar_name}")) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${scalar_name}");
+#
+#    var = ($scalar_type *) info->ptr ;
+#
+#    /* fprintf(stderr, "In ${Package}::${scalar_name}::FETCH - items %d\\n", items) ; */
+#
+#    ST(0) = sv_newmortal();
+EOF
+
+	if (! $readable) {
+	    print Q<<EOM ;
+#    croak("scalar is write-only") ;
+EOM
+	}
+        elsif ($scalar_methods{FETCH}) {
+	    foreach (@{ $scalar_methods{FETCH} }) {
+        print Q<<"EOF";
+#       $_
+EOF
+	    }
+	}
+        else {
+            StackTie($scalar_type, "var") or
+	    gen_scalar_FETCH($scalar_type, "var") or
+	    &generate_output($scalar_type, 0, "var")
+	} 
+        
+        print Q<<"EOF";
+#
+#    XSRETURN(1);
+#
+#]]
+#
+#XS(XS_${Packid}__${scalar_name}_STORE)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#    $scalar_type * var ;
+#
+#
+#    if (items != 2)
+#        croak("Usage: ${Package}::${scalar_name}::STORE(var, value)") ;
+#
+#    if (sv_isa(ST(0), "${Package}::${scalar_name}")) {
+#        IV tmp = (IV)SvPVX((SV*)SvRV(ST(0)));
+#        info = (XS_cdata_info_t*) tmp ;
+#    }
+#    else
+#        croak("value is not of type ${Package}::${scalar_name}") ;
+#
+#    var = ($scalar_type *) info->ptr ;
+#
+#    /* fprintf(stderr, "In ${Package}::${scalar_name}::STORE - items %d, info = %X, ptr = %X\\n", items, info, var) ; */
+#
+EOF
+
+	if (! $writable) {
+	    print Q<<EOM ;
+#    croak("scalar is read-only") ;
+EOM
+	}
+        elsif ($scalar_methods{STORE}) {
+            foreach (@{ $scalar_methods{STORE} }) {
+        print Q<<"EOF";
+#       $_
+EOF
+            }
+        }
+	else {
+	    DeStackTie($scalar_type, "var")  or
+	    gen_scalar_STORE($scalar_type, "var")  or
+            &generate_init($scalar_type, 3, "var")  ;
+	}
+
+        print Q<<"EOF";
+#
+#    XSRETURN(1);
+#
+#]]
+#
+EOF
+
+
+}
+
+sub OutputStandard
+{
+    # Include these functions once per file
+    # (eventually move them into Perl proper or another module)
+
+    if ($Printed_Already == 0) {
+	++ $Printed_Already ;
+    
+	print <<"EOF" ;
+
+/* Flags for XS_cdata_info_t below */
+#define XS_STRUCT_PERL_ALLOCED  1       /* data allocated by Perl*/
+
+EOF
+
+        print Q<<"EOF"  ;
+#
+#/* Data Structure for holding structure information */
+#typedef struct {
+#    void *      ptr;    /* pointer to the real C data structure */
+#    unsigned    size;   /* total no of bytes used */
+#    unsigned    count;  /* Number of elements in an array */
+#    unsigned    flags;  /* misc flags */
+#    short       type ;  /* ARRAY/HASH/SCALAR */
+#    SV *        refs ;  /* Holds references to other data structures */
+#    SV *	 tied ;  /* HV/AV/SV which is tied	*/
+#} XS_cdata_info_t ;
+# 
+#
+#static SV *
+#Ref2Tied(type, name, size, count, pointer, clone)
+#int	type ;
+#char *   name ;
+#unsigned size ;
+#unsigned count ;
+#void *   pointer ;
+#int	clone ;
+#[[
+#    XS_cdata_info_t * info ;
+#    SV * rv ;
+#    SV * sv ;
+#    SV * hav ;
+#    HV * stash = (HV*) gv_stashpv(name, TRUE) ;
+#
+#    /* warn("Ref2Tied(type=%d, name='%s', size=%d, count=%d, ptr=%X, clone=%d)", type, name, size, count, pointer, clone) ; */
+#
+#    /* internal consistency check */
+#    if (!pointer && clone)
+#	croak("In Ref2Tied - can't have null pointer and clone\\n") ;
+#
+#    sv = newSV(sizeof(XS_cdata_info_t)) ;
+#
+#    info = (XS_cdata_info_t*)SvPVX(sv) ;
+#    memzero(info, sizeof(XS_cdata_info_t)) ;
+#
+#    info->type  = type ;
+#    info->size  = size ;
+#    info->count = count ;
+#
+#    if (type == $t_HASH)
+#        info->refs  = (SV*)newHV() ;
+#    else if (type == $t_ARRAY)
+#        info->refs  = (SV*)newAV() ;
+#
+#    if (!pointer || clone) {
+#        info->flags |= XS_STRUCT_PERL_ALLOCED ;
+#
+#        /* allocate space for the real C data structure */
+#        info->ptr = (void*)safemalloc(size * count) ;
+#	 if (clone)
+#	     memcpy(info->ptr, pointer, size*count) ;
+#        else
+#            memzero(info->ptr, size * count) ;
+#    }
+#    else
+#	info->ptr = (void*) pointer ;
+#
+#    /* Make the private data into an object */
+#    rv = newRV(sv) ;
+#    sv_bless(rv, stash) ; 
+#
+#    /* Create the hash, array or scalar */
+#    if (type == $t_SCALAR)
+#        hav = (SV*)newSV(); 
+#    else if (type == $t_HASH)
+#        hav = (SV*)newHV(); 
+#    else /* an array */
+#        hav = (SV*)newAV(); 
+#
+#    /* Tie the hash/array/scalar to the package */
+#    if (type == $t_SCALAR)
+#        sv_magic(hav, rv, 'q', Nullch, 0);
+#    else
+#        sv_magic(hav, rv, 'P', Nullch, 0);
+#
+#    /* Remember the hash/array/scalar that was tied */
+#    /* Not sure if this is needed, but it can stay for now */
+#    info->tied = sv ;
+#
+#    SvREFCNT_dec(sv) ; 
+#    SvREFCNT_dec(rv) ; 
+# 
+#   /* return a blessed reference to the hash/array/scalar */
+# {
+#    SV * outer = newRV((SV*)hav) ;
+#    SvREFCNT_dec(hav) ; 
+#    return  sv_2mortal(sv_bless( outer,  stash )) ; 
+#  }
+# 
+#]]
+#
+#static SV *
+#GetInternalObject(sv)
+#SV * sv ;
+#[[
+#    SV * info = (SV*) NULL ;
+#    SV * s ;
+#    MAGIC * mg ;
+#
+#    if (sv == NULL || !SvROK(sv))
+#        return NULL ;
+#
+#    s = SvRV(sv) ;
+#    if (SvMAGICAL(s))
+#    {
+#        if (SvTYPE(s) == SVt_PVHV || SvTYPE(s) == SVt_PVAV)
+#            mg = mg_find(s, 'P') ;
+#        else
+#            mg = mg_find(s, 'q') ;
+#
+#	 /* all this testing is probably overkill, but till I know more
+#	    about global destruction it stays.
+#	 */
+#        if (mg && mg->mg_obj && SvRV(mg->mg_obj) && SvPVX(SvRV(mg->mg_obj)))
+#            /* info = (void*) SvPVX(SvRV(mg->mg_obj)) ; */
+#            info = mg->mg_obj ;
+#    }
+#
+#    return info ;
+#]]
+#
+#static XS_cdata_info_t *
+#GetInternalData(sv)
+#SV * sv ;
+#[[
+#    void * info = (void*) NULL ;
+#    SV * s ;
+#    MAGIC * mg ;
+#
+#    if (sv == NULL || !SvROK(sv))
+#        return NULL ;
+#
+#    s = SvRV(sv) ;
+#    if (SvMAGICAL(s))
+#    {
+#        if (SvTYPE(s) == SVt_PVHV || SvTYPE(s) == SVt_PVAV)
+#            mg = mg_find(s, 'P') ;
+#        else
+#            mg = mg_find(s, 'q') ;
+#
+#        /* all this testing is probably overkill, but till I know more
+#           about global destruction it stays.
+#        */
+#        if (mg && mg->mg_obj && SvRV(mg->mg_obj) && SvPVX(SvRV(mg->mg_obj)))
+#            info = (void*) SvPVX(SvRV(mg->mg_obj)) ; 
+#    }
+#
+#    return (XS_cdata_info_t *) info ;
+#
+#    /* if (sv)
+#        return (void*) SvPVX(SvRV(GetInternalObject(sv))) ;
+#    else
+#        return NULL ; */
+#]]
+#
+#static void
+#DumpInternalObj(sv)
+#SV * sv ;
+#[[
+#    XS_cdata_info_t * info ;
+#    HE * he ;
+#    char * key ;
+#    long len ;
+#    SV * value ;
+#
+#    info = GetInternalData(sv) ;
+#    warn("Internal Object %X\\n", info) ;
+#    if (info == NULL)
+#	return ;
+#    warn("  Pointer = %X  Size = %d  Count = %d\\n", info->ptr, info->size,
+#	info->count) ;
+#    warn("  Type    = %d  Flags   = %d\\n", info->type, info->flags) ;
+#    hv_iterinit((HV*)info->refs) ;
+#    while (he = hv_iternext((HV*)info->refs)) {
+#        key = hv_iterkey(he, &len) ;
+#        value = hv_iterval((HV*)info->refs, he) ;
+#        warn("    Key '%*s' => Value %X\\n", len, key, value) ;
+#    }
+#]]
+#
+EOF
+
+
+        foreach $method ( qw( DESTROY clone sizeof addressof lengthof))
+        {
+            PrintMethod ($method, $Cdata_C, $Cdata_perl, $Meth{$method})  ;
+            MkNewXS("${Cdata_C}_$method", "${Cdata_perl}::$method");
+        }
+    }
+	
+}
+
+
+BEGIN {
+$Meth{'DESTROY'} = <<EOM ;
+#    /* fprintf(stderr, "In DESTROY info = %x\\n", info) ; */
+#
+#    if (info) {
+#        if (info->ptr && (info->flags & XS_STRUCT_PERL_ALLOCED) == XS_STRUCT_PERL_ALLOCED) {
+#	    safefree(info->ptr) ; 
+#        } 
+#
+#        SvREFCNT_dec(info->refs) ;
+#    }
+#    else {
+#	/* fprintf(stderr,"rv = %x\\n", SvRV(ST(0)) ) ;
+#	fprintf(stderr,"pvx = %x\\n", SvPVX(SvRV(ST(0))) ) ; */
+#        if (0 && ST(0) && SvRV(ST(0)) && SvPVX(SvRV(ST(0)))) {
+#            info = (XS_cdata_info_t *)SvPVX(SvRV(ST(0))) ;
+#            if ( info->ptr &&  
+#               (info->flags & XS_STRUCT_PERL_ALLOCED) == XS_STRUCT_PERL_ALLOCED) 
+#                safefree(info->ptr) ; 
+#        }
+#    }
+#
+EOM
+
+$Meth{clone} = <<EOM ;
+#    ST(0) = sv_newmortal();
+#    /* Create a new reference */
+#    ST(0) = Ref2Tied(info->type, "package??",
+#                          info->count,  info->size, info->ptr, 1 ) ;
+EOM
+
+$Meth{sizeof} = <<EOM ;
+#    ST(0) = sv_newmortal();
+#    sv_setiv(ST(0), info->size) ;
+EOM
+
+$Meth{addressof} = <<EOM ;
+#    ST(0) = sv_newmortal();
+#    sv_setiv(ST(0), (IV)info->ptr) ;
+EOM
+
+$Meth{lengthof} = <<EOM ;
+#    ST(0) = sv_newmortal();
+#    sv_setiv(ST(0), (IV)info->count) ;
+EOM
+
+}
+
+sub PrintMethod
+{
+    my ($method, $C_package, $Perl_package, $code) = @_ ;
+    my ($test) ;
+
+    if ($C_package eq $Cdata_C)
+        { $test = "sv_isobject(ST(0))" }
+    else
+        { $test = qq[sv_isa(ST(0), "${Perl_package}")] }
+
+    print Q<<EOM ; 
+#XS(XS_${C_package}_$method)
+#[[
+#    dXSARGS;
+#    XS_cdata_info_t * info ;
+#
+#    /* fprintf(stderr, "In ${Perl_package}::$method\\n" ) ; */
+#
+#    if (items != 1)
+#        croak("Usage: ${Perl_package}::$method(var)");
+#
+#    if ($test) 
+#        info = GetInternalData(ST(0)) ;
+#    else
+#        croak("value is not of type '${Perl_package}'") ;
+#
+$code
+#
+#    /* fprintf(stderr, "    still in ${Perl_package}::$method\\n") ; */
+#
+#    XSRETURN(1);
+#]]
+#
+EOM
+
+}
 
 sub Exit {
 # If this is VMS, the exit status has meaning to the shell, so we
-# use a predictable value (SS$_Abort) rather than an arbitrary
-# number.
-    exit ($Is_VMS ? 44 : $errors) ;
+# use a predictable value (SS$_Normal or SS$_Abort) rather than an
+# arbitrary number.
+    exit ($Is_VMS ? ($errors ? 44 : 1) : $errors) ;
 }
+  
+__END__
+
+=head1 NAME
+
+xsubpp - compiler to convert Perl XS code into C code
+
+=head1 SYNOPSIS
+
+B<xsubpp> [B<-v>] [B<-C++>] [B<-except>] [B<-s pattern>] [B<-prototypes>] [B<-noversioncheck>] [B<-typemap typemap>]... file.xs
+
+=head1 DESCRIPTION
+
+I<xsubpp> will compile XS code into C code by embedding the constructs
+necessary to let C functions manipulate Perl values and creates the glue
+necessary to let Perl access those functions.  The compiler uses typemaps to
+determine how to map C function parameters and variables to Perl values.
+
+The compiler will search for typemap files called I<typemap>.  It will use
+the following search path to find default typemaps, with the rightmost
+typemap taking precedence.
+
+	../../../typemap:../../typemap:../typemap:typemap
+
+=head1 OPTIONS
+
+=over 5
+
+=item B<-C++>
+
+Adds ``extern "C"'' to the C code.
+
+
+=item B<-except>
+
+Adds exception handling stubs to the C code.
+
+=item B<-typemap typemap>
+
+Indicates that a user-supplied typemap should take precedence over the
+default typemaps.  This option may be used multiple times, with the last
+typemap having the highest precedence.
+
+=item B<-v>
+
+Prints the I<xsubpp> version number to standard output, then exits.
+
+
+=item B<-prototypes>
+
+By default I<xsubpp> will not automatically generate prototype code for
+all xsubs. This flag will enable prototypes.
+
+=item B<-noversioncheck>
+
+Disables the run time test that determines if the object file (derived
+from the C<.xs> file) and the C<.pm> files have the same version
+number.
+
+=back
+
+=head1 ENVIRONMENT
+
+No environment variables are used.
+
+=head1 AUTHOR
+
+Originally Larry Wall. Hacked by Paul Marquess and others.
+
+=head1 MODIFICATION HISTORY
+
+See the file F<changes.pod>.
+
+=head1 SEE ALSO
+
+perl(1), perlxs(1), perlxstut(1), perlguts(1)
+
+=cut
+

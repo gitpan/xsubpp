@@ -1,0 +1,284 @@
+
+xsubpp 2.000 alpha 1
+====================
+
+WARNING: This documentation is *very* incomplete.
+
+
+
+Objective.
+==========
+My goal was to allow easy access to real C data structures for Perl
+External extensions. This included both the ability to access global
+variables exported by C libraries and the ability to to make use of
+more complex C data types in xsub parameters and as variables. All of
+these goals have been achieved (partially at least).
+
+As someone recently said on this list (Tim, I think), make it easy to
+do the simple things, and make it possible to do the complex things.
+I'll let you be the judge of that.
+
+With that in mind I have attempted to make the default interface to
+this new stuff look as much like the original C as possible.
+
+
+Interfacing to simple data types
+================================
+
+Firstly there are the cases where you just want to interface to a
+simple (int, char*, ...) global variable in some external C library, an
+integer version number say. The typemap file already contains all the
+information necessary to read and write most non-complex data
+structures. So for this type of interface I wanted to be able to write
+something like
+
+	int	Year
+
+in the .xs file and let xsubpp create a read/write interface to the C
+variable which can be accessed from Perl like this
+
+	$Year = 1995 ;
+	...
+	if ($Year > 2000) ...
+
+This has been achieved using the suggestion made by Larry (last year I
+think) of associating an index with each C variable and tie'ing the
+Perl scalar to a package which can work out the correspondence between
+the index and the real C variable.
+
+Interface to Complex Data structures
+====================================
+
+The second case (and my main reason for extending xsubpp) is
+interfacing to complex C data structures (i.e. structures, unions,
+arrays). As there is no real support for these in xsubpp it was
+necessary to design some.
+
+As with the simple data types I wanted to keep the default definition
+of the data structures simple and as close to C as possible.
+
+.xs interface
+=============
+
+An XS file is currently split into a number of sections. Everything up
+to the first MODULE line is written the the C file verbatim. Thereafter
+the file contains a sequence of MODULE sections, each of which contain
+a number of XSUB definitions.
+
+In order to keep with the spirit of this structure and remain backward
+compatible with existing code I have defined a number of new
+sub-sections for the MODULE section.
+
+The list below shows the new sub-sections.
+
+	XSUB
+	TYPE HASH
+	TYPE ARRAY
+	TYPE SCALAR
+	VAR
+
+If no sub-section is specified XSUB will be assumed. This will allow
+existing .xs files to be parsed with the new xsubpp.
+
+
+XSUB
+-----
+Used to define xsubs. No change from the original xsubpp.
+
+
+TYPE HASH
+---------
+Creates a type definition for a C structure/union. The struct/union
+definition is 'similar' to the equivalent C definition. Consider the
+example below.
+
+	MODULE = Data	PACKAGE = Data
+
+	TYPE HASH
+
+	struct fred
+	    int	alpha
+	    short beta
+
+
+The first line of the data type definition *must* correspond to the C
+definition for the data type. So in this case
+
+	struct fred
+
+is the C data type we are creating an interface to.
+
+To make it a bit easier to use existing C structure definitions xsubpp
+will remove any trailing semicolons, and also get rid of any '{' or '}'
+it finds. So struct fred can be written like this:
+
+	struct fred {
+	    int	alpha ;
+	    short beta ;
+	    } ;
+
+As with XSUB's it is possible to tailor the default behavior of the
+interface.
+
+	TYPE HASH
+
+	struct fred
+	    int	alpha
+	    short beta
+	    FETCH: alpha
+		... code
+	    STORE: beta
+		... code
+	    ACCESS: ro alpha
+	    ACCESS: wo alpha
+
+NOTE: The structure/union must be defined *completely* before any of
+      the tailoring code is introduced.
+
+So FETCH: allows you to modify the default read interface for an
+individual element of the structure/union. STORE: does the same for the
+write interface.
+
+ACCESS: allows you to make individual elements of the structure/union
+read-only or write-only.
+
+In addition to FETCH, STORE and ACCESS, you have SIZEOF:, ADDRESSOF:,
+LENGTHOF:, CLONE:, NEW: and DESTROY:. These methods apply to the
+complete data type and not individual elements. 
+
+Note that not all of these last methods have been fully implemented
+yet.
+
+
+
+TYPE ARRAY
+----------
+Creates a type definition for an array.
+
+	MODULE = Data	PACKAGE = Data
+
+	TYPE ARRAY
+
+	int myarray [100] ;
+
+Works the same way as the TYPE HASH except the definition of the array
+takes only 1 line. 
+
+
+TYPE SCALAR
+------------
+Creates a type definition for a scalar. I'm not sure if this section
+will be kept.
+
+VAR
+---
+This sub-section creates an interface to *existing* C variables. Note
+that the C variable is assumed to exist already. This sub-section only
+creates the Perl interface to the variable.
+
+There are currently two variations with this sub-section.
+
+The first (which might or might not get dropped) is interfacing to
+simple data types like int and long. In these cases a definition like
+this
+
+	VAR
+
+	int fred ;
+
+will create a Perl interface which will allow 'fred' to be accessed
+directly, thus:
+
+	$fred = 1 ;
+	$b = $fred ;
+
+The second variation is interfacing to a type defined in one of the
+TYPE * sub-sections. In this case a definition like this:
+
+	VAR
+
+	struct  fred MyFred ;
+
+will create a Perl interface which is accessed via a reference, thus:
+
+	$MyFred->{alpha} = 2 ;
+	$x = $MyFred->{beta} + 1 ;
+
+
+
+
+TYPEMAP Interface
+=================
+It was necessary to extend the TYPEMAP file a bit. As with the .xs
+file, I have tried to keep the file backward compatible with the
+existing file.
+
+Both the INPUT and OUTPUT sections remain unchanged. The TYPEMAP
+section has been extended to take an optional parameter thus.
+
+	TYPEMAP
+	TYPEMAP XSUB
+	TYPEMAP HASH
+	TYPEMAP ARRAY
+	TYPEMAP SCALAR
+
+The first two, TYPEMAP and TYPEMAP XSUB are equivalent. TYPEMAP HASH is
+used for the elements of structures/unions. 
+
+When xsubpp is resolving a type for a structure element it will first
+check TYPEMAP HASH. If there is an entry it will be used. If not the
+TYPEMAP XSUB will be checked. This has been done because the existing
+typemap entries for quite a few types are fine for accessing the
+structure elements.
+
+The type resolution is the same with TYPEMAP ARRAY and TYPEMAP SCALAR.
+
+Perl Interface
+===============
+
+The Perl interface to any data type defined in a TYPE * section in the
+.xs file is through a reference.
+
+A type (e.g. the struct fred shown above) can be instantiated thus
+
+	$a = new Data::fred ;
+
+and read from /write to thus
+
+	$a->{alpha} = 33 ;
+	$y = $a->{beta} ;
+
+Similarly for an array
+
+	$b = new Data::myarray ;
+	$b->[3] = 5 ;
+	$x = $b->[0] ;
+
+Other Methods
+-------------
+Each of the complex data structure types has a number of methods
+defined for it.
+
+    sizeof
+    lengthof
+    addressof
+    clone
+    
+The meaning of each of these is what you would expect in C (except
+clone, which is intended to create a duplicate of the complete data
+structure). So $b->lengthof is 100.
+
+What still needs to be done.
+============================
+
+    * references, destroy, tailoring of new/addressof
+	- references mostly work
+	- destroy has been ignored for now
+    * move util functions into core Perl?
+    * tidy up the 'new' function.
+    * naming - should it be MODULE::type ?
+    * test harness for both the new stuff *and* existing xsubpp functionality
+	-- started
+
+
+Paul Marquess <pmarquess@bfsec.bt.co.uk>
